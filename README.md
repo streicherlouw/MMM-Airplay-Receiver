@@ -1,184 +1,271 @@
 # MMM-Airplay-Receiver
 
 `MMM-Airplay-Receiver` adds AirPlay screen mirroring to a MagicMirror display
-on Raspberry Pi. An iPhone, iPad, or Mac can select the mirror from the normal
-Screen Mirroring menu and take over the display for the duration of the
-session. When sharing stops, MagicMirror returns automatically.
+on Raspberry Pi. An iPhone, iPad, or Mac can select the mirror from Apple's
+standard Screen Mirroring menu and use the complete display. MagicMirror is
+temporarily stopped during the session and returns automatically when sharing
+ends.
 
-The module uses [UxPlay](https://github.com/FDH2/UxPlay) as the AirPlay
-receiver and GStreamer as the hardware-accelerated video pipeline.
+The solution combines:
 
-## What are we building?
+- [UxPlay](https://github.com/FDH2/UxPlay) as the AirPlay receiver
+- GStreamer for hardware-accelerated audio and video rendering
+- A systemd user service for receiver availability and supervision
+- PM2 for the MagicMirror display handoff
+- PipeWire/WirePlumber for Raspberry Pi audio output
+- A MagicMirror module for status integration and notifications
 
-Let us describe the design as if we were explaining it to a rubber duck.
+The checked-in configuration targets the `Art Wall` Raspberry Pi installation
+and supports iPhone, iPad, and Mac clients over Wi-Fi.
 
-The mirror has two jobs:
+## Design principles
 
-1. Show MagicMirror during normal operation.
-2. Show an AirPlay stream fullscreen when an Apple device connects.
+### Receiver availability is independent of MagicMirror
 
-AirPlay discovery must remain available while MagicMirror is running, and the
-receiver must keep running when MagicMirror gives up the display. The video
-should go directly to the Raspberry Pi's native graphics stack rather than
-through MagicMirror's browser window.
+UxPlay runs under an external systemd user service rather than as a child of
+MagicMirror. The AirPlay receiver therefore remains advertised while
+MagicMirror is running and remains alive when MagicMirror releases the display.
 
-Those requirements lead to three separate responsibilities:
+### Mirrored media bypasses the MagicMirror browser
 
-- A background service owns the AirPlay receiver.
-- A receiver daemon coordinates the screen handoff.
-- A MagicMirror module observes the receiver and publishes integration events.
+AirPlay audio and video are rendered directly through GStreamer. Video is not
+decoded in Electron or passed through the MagicMirror DOM. This provides access
+to the Raspberry Pi's hardware H.264 decoder and native Wayland fullscreen
+surface.
+
+### Display ownership follows the stream lifecycle
+
+The receiver daemon interprets UxPlay lifecycle events and coordinates PM2.
+MagicMirror runs while the receiver is idle, stops when mirroring begins, and
+starts again after the client disconnects.
+
+### One low-latency profile serves all supported clients
+
+The receiver requests 1920×1080 at 60 Hz and presents frames without building a
+timestamp-synchronized playback queue. The same settings are used for iPhone,
+iPad, and Mac screen mirroring.
+
+### System audio changes are temporary
+
+The daemon saves the existing PipeWire volume and mute state before changing
+them for AirPlay. During mirroring, the Raspberry Pi output is unmuted and
+capped at 100%, while the Apple device controls the AirPlay stream gain. The
+saved Pi state is restored before MagicMirror returns.
+
+### The integration remains visually silent
+
+The MagicMirror module monitors receiver state and publishes notifications, but
+its on-screen status tile is disabled. PIN pairing is also disabled unless a
+client requires it for compatibility.
 
 ## Solution architecture
 
 ```mermaid
 flowchart LR
     Apple["iPhone, iPad, or Mac"] -->|"AirPlay over Wi-Fi"| UxPlay["UxPlay receiver"]
-    UxPlay --> Decode["V4L2 H.264 hardware decoder"]
-    Decode --> Wayland["Native fullscreen Wayland surface"]
-    UxPlay --> Gain["AirPlay-controlled stream gain"]
-    Gain --> PipeWire["PipeWire HDMI output"]
-    Daemon["External receiver daemon"] --> UxPlay
+
+    subgraph ReceiverService["systemd user service"]
+        Daemon["Receiver daemon"] -->|"start and supervise"| UxPlay
+        UxPlay -->|"lifecycle output"| Daemon
+        Daemon --> Status["Runtime status file"]
+        Daemon -->|"save, set, restore"| Wpctl["wpctl"]
+    end
+
+    UxPlay --> Video["H.264 video"]
+    Video --> Decoder["V4L2 hardware decoder"]
+    Decoder --> Convert["Video conversion"]
+    Convert --> Wayland["Fullscreen Wayland surface"]
+
+    UxPlay --> Audio["AirPlay-controlled stream gain"]
+    Audio --> Pulse["GStreamer pulsesink"]
+    Pulse --> PipeWire["PipeWire default HDMI sink"]
+    Wpctl --> PipeWire
+
     Daemon -->|"stream starts: stop"| PM2["PM2 / MagicMirror"]
     Daemon -->|"stream ends: start"| PM2
-    Daemon -->|"save, set 100%, restore"| PipeWire
-    Daemon --> Status["Runtime status file"]
     Status --> Module["MagicMirror integration module"]
 ```
-
-## Rubber-duck walkthrough
-
-### Who keeps AirPlay available?
-
-The `mmm-airplay-receiver.service` user service starts
-`receiver_daemon.js`. The daemon starts UxPlay and keeps it running
-independently from MagicMirror.
-
-UxPlay advertises the configured receiver name with Avahi/mDNS. This is why
-the mirror appears in the Screen Mirroring list even though the MagicMirror UI
-does not display an AirPlay status message.
-
-### Who decides what owns the screen?
-
-The daemon reads UxPlay's lifecycle output.
-
-- When UxPlay is ready, MagicMirror is allowed to run.
-- When mirroring starts, the daemon asks PM2 to stop `MagicMirror`.
-- When mirroring ends, the daemon asks PM2 to start `MagicMirror`.
-- When the service stops, its systemd cleanup also starts MagicMirror.
-
-The daemon remains alive throughout the handoff, so the AirPlay connection and
-the process controlling MagicMirror do not depend on one another.
-
-### How does video reach the display?
-
-UxPlay receives the AirPlay H.264 stream and passes it to GStreamer. The
-pipeline uses the Raspberry Pi's V4L2 H.264 decoder, converts the decoded
-frames into a displayable format, and sends them to a native Wayland sink.
-
-The Wayland sink owns a fullscreen surface. It is not embedded in MagicMirror
-and it does not rely on the Raspberry Pi desktop window layout. This gives the
-stream the whole display, including the area normally occupied by desktop
-panels or MagicMirror.
-
-### How do the Apple device's volume buttons work?
-
-UxPlay receives the AirPlay volume selected by the connected device and maps it
-onto the GStreamer audio stream with a tapered gain curve. The phone or tablet
-therefore controls the audible mirroring volume.
-
-At the start of a session, the daemon reads and saves the current PipeWire
-default-sink volume and mute state. It sets that sink to an unmuted 100% ceiling
-while UxPlay applies the client-controlled stream gain. At the end of the
-session, the daemon restores the saved Pi volume and mute state. Duplicate
-stream events do not overwrite the saved state.
-
-### What does the MagicMirror module do?
-
-In external-service mode, the module does not launch UxPlay. Its node helper
-polls the daemon's JSON status file once per second and forwards lifecycle
-changes to MagicMirror as notifications.
-
-The visible module tile is disabled with `showStatus: false`. The module still
-provides integration state for any other MagicMirror module that wants to
-react to AirPlay activity.
-
-### What happens during one session?
-
-1. systemd starts the receiver daemon with the graphical-session environment.
-2. The daemon starts UxPlay.
-3. UxPlay advertises `Art Wall` on the local network.
-4. A user selects `Art Wall` from Screen Mirroring.
-5. UxPlay establishes the stream and creates the fullscreen Wayland surface.
-6. The daemon marks the state as `STREAMING`, saves the Pi volume, sets the HDMI
-   sink to 100%, and stops MagicMirror through PM2.
-7. GStreamer decodes and renders the stream; the Apple device controls its
-   audio gain.
-8. When the client disconnects, the daemon restores the Pi volume and mute
-   state.
-9. The daemon marks the state as `READY` and starts MagicMirror again.
-10. UxPlay remains advertised for the next session.
 
 ## Component responsibilities
 
 | Component | Responsibility |
 | --- | --- |
-| `systemd/mmm-airplay-receiver.service` | Starts, supervises, and restarts the external receiver daemon |
-| `receiver_daemon.js` | Owns UxPlay, interprets stream events, writes status, and coordinates MagicMirror and volume handoffs |
-| `receiver-daemon.config.json` | Defines the receiver, display, audio, volume, performance, and PM2 profile |
-| `lib/uxplay.js` | Validates configuration and builds the UxPlay command and environment |
-| `lib/daemon-events.js` | Converts UxPlay output into `READY` and `STREAMING` lifecycle events |
-| `lib/system-volume.js` | Saves, caps, unmutes, and restores the PipeWire default-sink volume |
-| `MMM-Airplay-Receiver.js` | Provides the MagicMirror-side integration and notifications |
-| `node_helper.js` | Monitors external status or, in optional in-process mode, owns UxPlay directly |
-| UxPlay | Implements the AirPlay receiver and creates the GStreamer pipeline |
-| GStreamer | Decodes, converts, and renders the audio/video stream |
-| Avahi | Publishes the receiver over mDNS |
-| PM2 | Runs MagicMirror and accepts the daemon's stop/start handoff |
+| `systemd/mmm-airplay-receiver.service` | Starts and supervises the receiver independently from MagicMirror |
+| `receiver_daemon.js` | Owns UxPlay and serializes display and volume handoffs |
+| `receiver-daemon.config.json` | Defines the deployed AirPlay, rendering, audio, volume, and PM2 profile |
+| `lib/uxplay.js` | Validates receiver settings and builds the UxPlay command and graphical-session environment |
+| `lib/daemon-events.js` | Converts UxPlay output into `READY` and `STREAMING` state changes |
+| `lib/system-volume.js` | Captures, caps, unmutes, and restores the PipeWire default-sink volume |
+| `MMM-Airplay-Receiver.js` | Provides MagicMirror-side state, optional UI, and module notifications |
+| `node_helper.js` | Polls the external status file and forwards state into MagicMirror |
+| UxPlay | Implements AirPlay discovery, connection handling, and media reception |
+| GStreamer | Decodes, converts, and renders the audio/video streams |
+| Avahi | Advertises the receiver over mDNS |
+| PM2 | Runs MagicMirror and accepts the daemon's stop/start requests |
+| PipeWire/WirePlumber | Routes audio to the Raspberry Pi's selected HDMI output |
 
-## Reference rendering profile
+## Operating sequence
 
-The included `receiver-daemon.config.json` defines the Art Wall profile:
+### Service startup
 
-| Setting | Value | Design intent |
+1. The systemd user service starts `receiver_daemon.js` after the graphical
+   session and network are available.
+2. The daemon loads `receiver-daemon.config.json`.
+3. It builds the UxPlay environment, including the Wayland runtime directory,
+   Wayland socket, and D-Bus session address.
+4. The daemon starts UxPlay with line-buffered output.
+5. UxPlay advertises `Art Wall` through Avahi and reports that its server socket
+   is initialized.
+6. The daemon writes a `READY` status record. MagicMirror continues running.
+
+### Mirroring start
+
+1. An Apple device selects `Art Wall` and establishes an AirPlay session.
+2. UxPlay reports that mirroring has started.
+3. The daemon writes `STREAMING` to the runtime status file.
+4. A serialized session handoff performs two operations:
+   - The volume manager reads and stores the PipeWire default-sink volume and
+     mute state, sets a 100% ceiling, and unmutes the sink.
+   - PM2 stops the `MagicMirror` process.
+5. UxPlay renders video in a native fullscreen Wayland surface and sends audio
+   to the PipeWire-backed PulseAudio sink.
+
+### Active mirroring
+
+The Apple device controls the AirPlay stream volume. UxPlay maps those volume
+events onto the GStreamer audio stream using the configured tapered gain curve.
+The Raspberry Pi master output remains at its temporary 100% ceiling throughout
+the session.
+
+Video is decoded and presented independently of MagicMirror. The receiver
+daemon stays active, monitors UxPlay, records selected format and performance
+messages, and waits for the disconnect event.
+
+### Mirroring end
+
+1. UxPlay reports that the mirror stream has stopped.
+2. The daemon writes `READY` to the runtime status file.
+3. The serialized handoff restores the exact PipeWire volume and mute state
+   captured at session start.
+4. PM2 starts MagicMirror after volume restoration completes.
+5. UxPlay remains active and advertised for the next client.
+
+### Receiver or service shutdown
+
+If UxPlay exits unexpectedly, the daemon restores the saved audio state, starts
+MagicMirror, and schedules a receiver restart after the configured delay.
+Normal `SIGINT`, `SIGTERM`, and uncaught-error shutdown paths also request
+volume restoration and MagicMirror startup. The systemd unit includes an
+`ExecStopPost` fallback that starts MagicMirror when the service stops.
+
+Duplicate lifecycle messages are idempotent. A second `STREAMING` event cannot
+replace the saved pre-session volume with the temporary 100% value, and a
+second `READY` event does not repeat the restoration.
+
+Like any in-memory cleanup mechanism, restoration cannot run after an immediate
+power loss or `SIGKILL`.
+
+## Video pipeline
+
+The deployed video profile is defined in `receiver-daemon.config.json`:
+
+| Setting | Value | Purpose |
 | --- | --- | --- |
-| Receiver name | `Art Wall` | Friendly name in Apple's Screen Mirroring menu |
-| Resolution | `1920x1080@60` | Full-HD output with a 60 Hz stream target |
-| Advertised frame rate | `60` | Smooth video and desktop motion |
-| Video decoder | `v4l2h264dec` | Raspberry Pi H.264 hardware decoding |
-| Decoder I/O | `mmap` capture and output | Explicit V4L2 buffer allocation |
-| Video conversion | `videoconvert` | Converts decoded frames for the Wayland sink |
-| Video sink | `waylandsink` | Native rendering in the active Wayland session |
-| Fullscreen owner | `waylandsink fullscreen=true` | Gives the stream the complete display |
-| Video timing | `-vsync no`, `sync=false`, `async=false` | Presents received frames without adding a playback queue |
-| Audio sink | Low-buffer `pulsesink` | Sends audio to the graphical session with minimal buffering |
-| AirPlay volume curve | `-db -50:0 -taper` | Maps device volume buttons onto a useful tapered stream-gain range |
-| Pi volume ceiling | `100%` | Makes the full HDMI output range available during mirroring |
-| Volume restoration | Enabled | Returns the previous Pi volume and mute state after mirroring |
-| Pairing | `pin: false` | Allows normal clients without mandatory PIN entry |
-| MagicMirror handoff | `manageMagicMirror: true` | Stops and starts the configured PM2 process automatically |
+| Requested resolution | `1920x1080@60` | Requests Full HD output and a 60 Hz client stream |
+| Maximum frame rate | `60` | Supports smooth video and desktop movement |
+| Decoder | `v4l2h264dec` | Uses Raspberry Pi H.264 hardware decoding |
+| Decoder I/O | `capture-io-mode=mmap output-io-mode=mmap` | Uses explicit V4L2 memory-mapped buffers |
+| Converter | `videoconvert` | Converts decoded frames for the selected Wayland sink |
+| Color handling | `-bt709 -srgb no` | Selects the color path used by the Raspberry Pi display pipeline |
+| UxPlay fullscreen | `false` | Leaves generic `-fs` disabled |
+| Video sink | Native fullscreen `waylandsink` | Owns the complete Wayland output while mirroring |
+| Freeze behavior | `-nofreeze` | Closes the video surface when mirroring ends |
+| Timing | `-vsync no`, `sync=false`, `async=false` | Presents frames immediately instead of queueing for timestamp playback |
 
-The complete video sink string is:
-
-```text
-waylandsink fullscreen=true sync=false async=false enable-last-sample=false processing-deadline=0
-```
-
-The decoder and converter arguments are:
+The generated decoder and converter arguments are:
 
 ```text
 -vd "v4l2h264dec capture-io-mode=mmap output-io-mode=mmap"
 -vc videoconvert
 ```
 
-`fullscreen` is set to `false` in the daemon configuration because that option
-controls UxPlay's generic `-fs` flag. Fullscreen ownership belongs to the native
-Wayland sink in this architecture.
+The complete video sink is:
 
-The same immediate-rendering profile is used for iPhone, iPad, and Mac clients.
-It prioritizes screen-response latency and cross-device behavior over building
-a larger timestamp-synchronized playback buffer.
+```text
+waylandsink fullscreen=true sync=false async=false enable-last-sample=false processing-deadline=0
+```
 
-The system-volume handoff is configured with:
+Fullscreen is deliberately owned by `waylandsink fullscreen=true`. The daemon's
+`fullscreen: false` setting only disables UxPlay's generic `-fs` option; it does
+not make the resulting video window non-fullscreen.
+
+## Audio and volume pipeline
+
+### Audio rendering
+
+UxPlay passes mirrored audio through GStreamer to:
+
+```text
+pulsesink sync=false async=false buffer-time=20000 latency-time=10000 processing-deadline=0
+```
+
+On the Raspberry Pi, the PulseAudio protocol is provided by PipeWire. The sink
+therefore routes to the WirePlumber-selected default output, currently the HDMI
+stereo device.
+
+The sink uses a 20 ms buffer and 10 ms latency target. Timestamp synchronization
+is disabled to match the immediate video presentation strategy.
+
+### Apple device volume
+
+UxPlay receives AirPlay volume changes generated by the connected device. The
+profile adds:
+
+```text
+-db -50:0 -taper
+```
+
+`-db -50:0` maps the AirPlay control range onto a stream-gain range from mute or
+heavy attenuation through 0 dB. `-taper` applies a perceptual taper so the
+volume buttons provide useful control across the range instead of clustering
+most of the audible change near maximum volume.
+
+This changes the GStreamer stream gain; it does not repeatedly move the
+PipeWire master-volume slider.
+
+### Raspberry Pi volume ceiling
+
+The effective output during mirroring has two stages:
+
+```text
+audible output = temporary Pi system ceiling × AirPlay stream gain
+```
+
+The daemon uses `wpctl` to make the full Pi output range available while the
+Apple device controls the stream:
+
+1. Run `wpctl get-volume @DEFAULT_AUDIO_SINK@`.
+2. Parse and save both the scalar volume and `[MUTED]` state.
+3. Set the default sink to the configured limit with `wpctl set-volume -l`.
+4. Unmute the default sink with `wpctl set-mute ... 0`.
+5. On disconnect, restore the saved scalar volume.
+6. Restore the saved mute state.
+
+For the checked-in configuration, an idle Pi volume of 40% transitions as
+follows:
+
+```text
+before mirroring: 40%
+during mirroring: 100% system ceiling × Apple-controlled stream gain
+after mirroring:  40%
+```
+
+The volume manager logs command or parsing errors and allows mirroring to
+continue. It changes the system volume only after successfully reading the
+current value, so it always has a restoration value before applying the
+temporary ceiling.
+
+### Volume configuration
 
 ```json
 {
@@ -189,54 +276,99 @@ The system-volume handoff is configured with:
 }
 ```
 
-`systemVolumeLimitPercent` accepts values from 1 through 100. The configured
-limit is passed to `wpctl` as both the requested volume and the command ceiling.
+| Option | Meaning |
+| --- | --- |
+| `manageSystemVolume` | Enables capture, temporary adjustment, and restoration |
+| `systemVolumeLimitPercent` | Temporary sink level and command ceiling; accepts 1 through 100 |
+| `systemVolumeTarget` | WirePlumber object passed to `wpctl`; defaults to the current default audio sink |
+| `wpctlPath` | Absolute path to the WirePlumber control command |
 
-## Platform and network
+Set `manageSystemVolume` to `false` to leave the Pi master volume unchanged and
+use only UxPlay's AirPlay stream gain.
 
-The reference installation uses:
+## MagicMirror integration
+
+The MagicMirror module operates in external-service mode. It does not start or
+stop UxPlay. Its node helper reads the daemon's atomically-written status file
+once per second and forwards changes to the browser-side module.
+
+The status file is:
+
+```text
+/run/user/1000/mmm-airplay-receiver-status.json
+```
+
+It contains the state, message, receiver name, and update timestamp. States are
+`STARTING`, `READY`, `STREAMING`, `ERROR`, or `STOPPED`.
+
+The module publishes:
+
+- `AIRPLAY_RECEIVER_STATUS`
+- `AIRPLAY_RECEIVER_PIN`
+
+`showStatus: false` keeps the module DOM hidden. The integration and
+notifications remain active while MagicMirror is running.
+
+The repository also retains an optional in-process mode with
+`externalService: false`. In that mode, `node_helper.js` owns UxPlay and accepts
+`AIRPLAY_RECEIVER_START`, `AIRPLAY_RECEIVER_STOP`, and
+`AIRPLAY_RECEIVER_RESTART`. In-process mode cannot provide the same independent
+MagicMirror handoff and is not used by the Art Wall deployment.
+
+## Pairing and network access
+
+PIN pairing is disabled in `receiver-daemon.config.json`. Normal clients can
+connect without entering a code. Set `pin` to `true` for a generated PIN or to
+a four-digit string such as `"4821"` for a fixed PIN. Client registration is
+relevant only when PIN pairing is enabled.
+
+The Raspberry Pi and Apple device must be on the same local network. The network
+must allow:
+
+- Multicast UDP 5353 for Avahi/mDNS discovery
+- TCP and UDP 7000–7002 for the configured UxPlay session ports
+
+The deployed Pi has a Wi-Fi-only connection. A stable 5 GHz connection to the
+same access point is recommended for 1080p60 mirroring.
+
+## Platform requirements
+
+The deployed profile uses:
 
 - Raspberry Pi 4 with Raspberry Pi OS Bookworm
 - Native Wayland/labwc graphical session
 - MagicMirror managed by PM2 as `MagicMirror`
-- Node.js and PM2 under `/usr/local/bin`
-- UxPlay 1.73.6
-- Wi-Fi network connection
-
-The Pi and AirPlay client must be on the same local network, with multicast
-traffic allowed between them. A stable 5 GHz Wi-Fi connection is recommended
-for 1080p60 mirroring.
-
-## Install and deploy
-
-### Requirements
-
-- MagicMirror²
 - Node.js 18 or newer
-- PM2 managing MagicMirror
+- UxPlay 1.73.6
+- GStreamer with `v4l2h264dec`, `videoconvert`, `waylandsink`, and `pulsesink`
 - PipeWire/WirePlumber with `wpctl`
-- A Debian-based Raspberry Pi installation with a graphical session
-- SSH key authentication for remote deployment
+- Avahi for mDNS advertisement
+- Node.js and PM2 under `/usr/local/bin`
 
-### Copy the module and install UxPlay
+Other users, command locations, compositor sockets, output devices, or process
+names require corresponding configuration changes.
 
-From the development machine:
+## Installation and deployment
+
+### Deploy the module and UxPlay
+
+Configure SSH key authentication, then run from the development machine:
 
 ```bash
 ./scripts/deploy.sh --install-uxplay streicher@artwall1.local
 ```
 
-The `--install-uxplay` option installs build dependencies, builds the pinned
-UxPlay 1.73.6 release, installs the required GStreamer plugins, and enables
-Avahi. Omit it on later deployments.
+`--install-uxplay` installs the Debian build and GStreamer dependencies, builds
+the pinned UxPlay 1.73.6 release, installs it under `/usr/local`, and enables
+Avahi. Omit the option on subsequent deployments.
 
-The deploy script copies only this module. It does not read or replace
+The deployment script copies only this module. It does not read or replace
 MagicMirror's `config.js`.
 
-### Configure the MagicMirror integration
+### Configure MagicMirror
 
-Add this entry to the `modules` array in
-`~/MagicMirror/config/config.js` on the Pi:
+Add the following object to the `modules` array in
+`~/MagicMirror/config/config.js`:
 
 ```js
 {
@@ -251,12 +383,11 @@ Add this entry to the `modules` array in
 },
 ```
 
-The receiver name should match the name in `receiver-daemon.config.json`.
-The `/run/user/1000` path assumes that the graphical user ID is `1000`; use
-`id -u` on the Pi to check it.
+The receiver name should match `receiver-daemon.config.json`. The runtime path
+assumes that the graphical user's numeric ID is `1000`; verify it with `id -u`.
 
-The included helpers can add or update the module entry while retaining a
-timestamped backup:
+The included helpers preserve timestamped backups when adding or changing the
+module entry:
 
 ```bash
 node scripts/enable-module.mjs ~/MagicMirror/config/config.js "Art Wall" waylandsink
@@ -265,18 +396,9 @@ node scripts/update-module-config.mjs ~/MagicMirror/config/config.js \
   '{"externalService":true,"externalStatusFile":"/run/user/1000/mmm-airplay-receiver-status.json","showStatus":false}'
 ```
 
-### Install the receiver service
+### Install the external service
 
-On the Pi:
-
-```bash
-cd ~/MagicMirror/modules/MMM-Airplay-Receiver
-./scripts/install-service.sh
-pm2 restart MagicMirror
-```
-
-The service unit calls `/usr/local/bin/node`, and the daemon configuration calls
-`/usr/local/bin/pm2` and `/usr/bin/wpctl`. Check the paths before installation:
+Verify the configured executable paths on the Pi:
 
 ```bash
 command -v node
@@ -284,12 +406,15 @@ command -v pm2
 command -v wpctl
 ```
 
-Update the service or daemon configuration when the commands are installed in
-different locations.
+Install and start the user service:
+
+```bash
+cd ~/MagicMirror/modules/MMM-Airplay-Receiver
+./scripts/install-service.sh
+pm2 restart MagicMirror
+```
 
 ### Deploy an update
-
-From the development machine:
 
 ```bash
 ./scripts/deploy.sh streicher@artwall1.local
@@ -297,45 +422,19 @@ ssh streicher@artwall1.local \
   systemctl --user restart mmm-airplay-receiver.service
 ```
 
-## Pairing policy
+The service must be restarted after deployment so the daemon loads the new code
+and configuration.
 
-PIN pairing is disabled in `receiver-daemon.config.json`. A client can begin
-mirroring without entering a code.
+## Operations and diagnostics
 
-Set `pin` to `true` for a generated PIN, or use a four-digit string such as
-`"4821"` for a fixed PIN. `persistTrustedClients` is relevant only when PIN
-pairing is enabled.
-
-## Runtime state and notifications
-
-The daemon atomically writes its current state to:
-
-```text
-/run/user/1000/mmm-airplay-receiver-status.json
-```
-
-The state is one of `STARTING`, `READY`, `STREAMING`, `ERROR`, or `STOPPED`.
-The MagicMirror module republishes changes as:
-
-- `AIRPLAY_RECEIVER_STATUS`
-- `AIRPLAY_RECEIVER_PIN`
-
-The repository also supports an in-process mode with
-`externalService: false`. In that mode, `node_helper.js` starts UxPlay and
-accepts `AIRPLAY_RECEIVER_START`, `AIRPLAY_RECEIVER_STOP`, and
-`AIRPLAY_RECEIVER_RESTART`. The external-service architecture does not use
-those control notifications; systemd owns the receiver process.
-
-## Operations
-
-Check service and MagicMirror state:
+Check receiver and MagicMirror state:
 
 ```bash
 systemctl --user status mmm-airplay-receiver.service
 pm2 status
 ```
 
-Follow the receiver lifecycle and GStreamer output:
+Follow receiver lifecycle, rendering, and volume messages:
 
 ```bash
 journalctl --user -u mmm-airplay-receiver.service -f
@@ -347,34 +446,27 @@ Read the latest integration state:
 cat /run/user/1000/mmm-airplay-receiver-status.json
 ```
 
-Restart the receiver:
-
-```bash
-systemctl --user restart mmm-airplay-receiver.service
-```
-
-## Health checks
-
-AirPlay discovery:
-
-```bash
-systemctl status avahi-daemon
-```
-
-Hardware decoder availability:
-
-```bash
-gst-inspect-1.0 v4l2h264dec
-```
-
-PipeWire output and current system volume:
+Inspect the audio graph and current default-sink volume:
 
 ```bash
 wpctl status
 wpctl get-volume @DEFAULT_AUDIO_SINK@
 ```
 
-Wayland session values used by the reference configuration:
+Check AirPlay discovery and hardware decoding:
+
+```bash
+systemctl status avahi-daemon
+gst-inspect-1.0 v4l2h264dec
+```
+
+Restart the receiver:
+
+```bash
+systemctl --user restart mmm-airplay-receiver.service
+```
+
+The deployed graphical-session values are:
 
 ```text
 XDG_RUNTIME_DIR=/run/user/1000
@@ -382,22 +474,18 @@ WAYLAND_DISPLAY=wayland-0
 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 ```
 
-Network access requires multicast UDP 5353 for discovery and the configured
-UxPlay port range, 7000–7002 by default, for the receiver session.
-
-For playback interruptions, check Wi-Fi signal quality and the receiver
-journal first. The daemon records stream format, decoder messages, and a small
-number of UxPlay performance reports for each session.
+Adjust these values if the graphical user ID or Wayland socket changes.
 
 ## Development
 
-Run the tests and JavaScript syntax checks before deployment:
+Run the automated tests and JavaScript syntax checks before deployment:
 
 ```bash
 npm test
 npm run check
 ```
 
-The tests cover UxPlay argument generation, Wayland environment discovery,
-lifecycle parsing, PIN handling, system-volume capture and restoration, and
-the reference hardware-accelerated fullscreen profile.
+The tests cover UxPlay argument generation, graphical-session discovery,
+lifecycle parsing, pairing, hardware-accelerated fullscreen rendering, volume
+configuration, duplicate session events, mute-state handling, and exact volume
+restoration.
