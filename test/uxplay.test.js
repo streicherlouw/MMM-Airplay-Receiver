@@ -8,7 +8,7 @@ const {
   normalizeConfig,
   parseUxplayLine
 } = require("../lib/uxplay");
-const { classifyDaemonLine } = require("../lib/daemon-events");
+const { classifyDaemonLine, StreamLifecycle } = require("../lib/daemon-events");
 const daemonConfig = require("../receiver-daemon.config.json");
 
 test("builds low-latency defaults without mandatory PIN pairing", () => {
@@ -71,12 +71,75 @@ test("parses ready, streaming, disconnect, and PIN log events", () => {
   assert.equal(parseUxplayLine("Please enter PIN code: 4821").pin, "4821");
 });
 
-test("classifies external daemon stream lifecycle events", () => {
-  assert.equal(classifyDaemonLine("Initialized server socket(s)").state, "READY");
-  assert.equal(classifyDaemonLine("raop_rtp_mirror starting mirroring").state, "STREAMING");
-  assert.equal(classifyDaemonLine("raop_rtp_mirror exiting TCP thread").state, "READY");
-  assert.equal(classifyDaemonLine("video_reset: type = RTP_Shutdown").state, "READY");
+test("classifies external daemon audio and video lifecycle events", () => {
+  assert.deepEqual(classifyDaemonLine("Initialized server socket(s)"), { type: "server-ready" });
+  assert.deepEqual(classifyDaemonLine("raop_rtp starting audio"), {
+    type: "stream", stream: "audio", active: true
+  });
+  assert.deepEqual(classifyDaemonLine("raop_rtp exiting thread"), {
+    type: "stream", stream: "audio", active: false
+  });
+  assert.deepEqual(classifyDaemonLine("raop_rtp_mirror starting mirroring"), {
+    type: "stream", stream: "video", active: true
+  });
+  assert.deepEqual(classifyDaemonLine("raop_rtp_mirror exiting TCP thread"), {
+    type: "stream", stream: "video", active: false
+  });
+  assert.deepEqual(classifyDaemonLine("video_reset: type = RTP_Shutdown"), {
+    type: "stream", stream: "video", active: false
+  });
   assert.equal(classifyDaemonLine("unrelated debug line"), null);
+});
+
+test("tracks audio volume and video display handoffs independently", () => {
+  const lifecycle = new StreamLifecycle();
+  let state = lifecycle.apply(classifyDaemonLine("Initialized server socket(s)"));
+  assert.equal(state.state, "READY");
+  assert.equal(state.volumeChanged, false);
+  assert.equal(state.displayChanged, false);
+
+  state = lifecycle.apply(classifyDaemonLine("raop_rtp starting audio"));
+  assert.equal(state.state, "STREAMING");
+  assert.equal(state.message, "AirPlay audio is streaming");
+  assert.equal(state.volumeChanged, true);
+  assert.equal(state.displayChanged, false);
+
+  state = lifecycle.apply(classifyDaemonLine("raop_rtp starting audio"));
+  assert.equal(state.statusChanged, false);
+  assert.equal(state.volumeChanged, false);
+  assert.equal(state.displayChanged, false);
+
+  state = lifecycle.apply(classifyDaemonLine("raop_rtp_mirror starting mirroring"));
+  assert.equal(state.message, "An AirPlay client is mirroring");
+  assert.equal(state.volumeChanged, false);
+  assert.equal(state.displayChanged, true);
+
+  state = lifecycle.apply(classifyDaemonLine("raop_rtp exiting thread"));
+  assert.equal(state.anyActive, true);
+  assert.equal(state.videoActive, true);
+  assert.equal(state.volumeChanged, false);
+
+  state = lifecycle.apply(classifyDaemonLine("video_reset: type = RTP_Shutdown"));
+  assert.equal(state.state, "READY");
+  assert.equal(state.volumeChanged, true);
+  assert.equal(state.displayChanged, true);
+});
+
+test("keeps the volume handoff active when video ends before audio", () => {
+  const lifecycle = new StreamLifecycle();
+  lifecycle.apply(classifyDaemonLine("raop_rtp starting audio"));
+  lifecycle.apply(classifyDaemonLine("raop_rtp_mirror starting mirroring"));
+
+  let state = lifecycle.apply(classifyDaemonLine("raop_rtp_mirror exiting TCP thread"));
+  assert.equal(state.state, "STREAMING");
+  assert.equal(state.message, "AirPlay audio is streaming");
+  assert.equal(state.volumeChanged, false);
+  assert.equal(state.displayChanged, true);
+
+  state = lifecycle.apply(classifyDaemonLine("raop_rtp exiting thread"));
+  assert.equal(state.state, "READY");
+  assert.equal(state.volumeChanged, true);
+  assert.equal(state.displayChanged, false);
 });
 
 test("Art Wall daemon uses explicit Pi hardware decoding and native Wayland fullscreen", () => {

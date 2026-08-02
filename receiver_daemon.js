@@ -5,7 +5,7 @@ const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const { buildReceiverEnvironment, buildUxplayArgs, normalizeConfig } = require("./lib/uxplay");
-const { classifyDaemonLine } = require("./lib/daemon-events");
+const { classifyDaemonLine, StreamLifecycle } = require("./lib/daemon-events");
 const { SystemVolumeManager } = require("./lib/system-volume");
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +51,7 @@ const systemVolume = new SystemVolumeManager(
   }),
   log
 );
+const streamLifecycle = new StreamLifecycle();
 
 function writeStatus(state, message) {
   const status = {
@@ -91,15 +92,12 @@ function queueMagicMirror(shouldRun) {
   return pm2Queue;
 }
 
-function queueSessionHandoff(streaming) {
+function queueSessionHandoff({ anyActive, videoActive }) {
   handoffQueue = handoffQueue.then(async () => {
-    if (streaming) {
-      await Promise.all([systemVolume.beginSession(), queueMagicMirror(false)]);
-      return;
-    }
+    if (anyActive) await systemVolume.beginSession();
+    else await systemVolume.endSession();
 
-    await systemVolume.endSession();
-    await queueMagicMirror(true);
+    await queueMagicMirror(!videoActive);
   }).catch((error) => {
     log(`Session handoff failed: ${error.message}`);
   });
@@ -113,14 +111,14 @@ function handleReceiverLine(line) {
   const event = classifyDaemonLine(text);
   if (event) {
     log(text);
-    writeStatus(event.state, event.message);
-    if (event.state === "STREAMING") {
+    const lifecycle = streamLifecycle.apply(event);
+    if (lifecycle.statusChanged) writeStatus(lifecycle.state, lifecycle.message);
+    if (event.type === "stream" && event.stream === "video" && event.active) {
       receiverOutputLinesRemaining = receiverOutputSampleLines;
       performanceReportsRemaining = performanceReportSamples;
       capturingPerformanceReport = false;
-      queueSessionHandoff(true);
     }
-    if (event.state === "READY") queueSessionHandoff(false);
+    if (lifecycle.volumeChanged || lifecycle.displayChanged) queueSessionHandoff(lifecycle);
     return;
   }
 
@@ -188,6 +186,7 @@ function scheduleReceiverRestart() {
 function startReceiver() {
   if (receiver || shuttingDown) return;
 
+  streamLifecycle.reset();
   const uxplayArgs = buildUxplayArgs(receiverConfig);
   if (daemonConfig.debugReceiver && !uxplayArgs.includes("-d")) {
     uxplayArgs.push("-d");
@@ -211,18 +210,20 @@ function startReceiver() {
 
   child.once("error", (error) => {
     if (receiver === child) receiver = null;
+    streamLifecycle.reset();
     writeStatus("ERROR", `Could not start UxPlay: ${error.message}`);
-    queueSessionHandoff(false);
+    queueSessionHandoff({ anyActive: false, videoActive: false });
     scheduleReceiverRestart();
   });
 
   child.once("close", (code, signal) => {
     if (receiver === child) receiver = null;
     if (shuttingDown) return;
+    streamLifecycle.reset();
     const reason = signal ? `signal ${signal}` : `exit code ${code}`;
     writeStatus("ERROR", `UxPlay stopped (${reason})`);
     log(`UxPlay stopped (${reason})`);
-    queueSessionHandoff(false);
+    queueSessionHandoff({ anyActive: false, videoActive: false });
     scheduleReceiverRestart();
   });
 }
@@ -233,7 +234,7 @@ async function shutdown(signal) {
   log(`Stopping after ${signal}`);
   if (restartTimer) clearTimeout(restartTimer);
   if (receiver) receiver.kill("SIGTERM");
-  await queueSessionHandoff(false);
+  await queueSessionHandoff({ anyActive: false, videoActive: false });
   process.exit(0);
 }
 
@@ -241,7 +242,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("uncaughtException", async (error) => {
   log(`Uncaught error: ${error.stack || error.message}`);
-  await queueSessionHandoff(false);
+  await queueSessionHandoff({ anyActive: false, videoActive: false });
   process.exit(1);
 });
 

@@ -33,11 +33,11 @@ decoded in Electron or passed through the MagicMirror DOM. This provides access
 to the Raspberry Pi's hardware H.264 decoder and native Wayland fullscreen
 surface.
 
-### Display ownership follows the stream lifecycle
+### Display ownership follows the video lifecycle
 
 The receiver daemon interprets UxPlay lifecycle events and coordinates PM2.
-MagicMirror runs while the receiver is idle, stops when mirroring begins, and
-starts again after the client disconnects.
+MagicMirror stops only while a video-mirroring stream is active. Audio-only
+AirPlay leaves MagicMirror visible and changes only the audio path.
 
 ### One low-latency profile serves all supported clients
 
@@ -48,9 +48,10 @@ iPad, and Mac screen mirroring.
 ### System audio changes are temporary
 
 The daemon saves the existing PipeWire volume and mute state before changing
-them for AirPlay. During mirroring, the Raspberry Pi output is unmuted and
-capped at 100%, while the Apple device controls the AirPlay stream gain. The
-saved Pi state is restored before MagicMirror returns.
+them for AirPlay. During either audio-only streaming or video mirroring, the
+Raspberry Pi output is unmuted and capped at 100%, while the Apple device
+controls the AirPlay stream gain. The saved Pi state is restored after the last
+active AirPlay media stream ends.
 
 ### The integration remains visually silent
 
@@ -81,8 +82,8 @@ flowchart LR
     Pulse --> PipeWire["PipeWire default HDMI sink"]
     Wpctl --> PipeWire
 
-    Daemon -->|"stream starts: stop"| PM2["PM2 / MagicMirror"]
-    Daemon -->|"stream ends: start"| PM2
+    Daemon -->|"video starts: stop"| PM2["PM2 / MagicMirror"]
+    Daemon -->|"video ends: start"| PM2
     Status --> Module["MagicMirror integration module"]
 ```
 
@@ -94,7 +95,7 @@ flowchart LR
 | `receiver_daemon.js` | Owns UxPlay and serializes display and volume handoffs |
 | `receiver-daemon.config.json` | Defines the deployed AirPlay, rendering, audio, volume, and PM2 profile |
 | `lib/uxplay.js` | Validates receiver settings and builds the UxPlay command and graphical-session environment |
-| `lib/daemon-events.js` | Converts UxPlay output into `READY` and `STREAMING` state changes |
+| `lib/daemon-events.js` | Classifies UxPlay audio/video events and tracks both stream types independently |
 | `lib/system-volume.js` | Captures, caps, unmutes, and restores the PipeWire default-sink volume |
 | `MMM-Airplay-Receiver.js` | Provides MagicMirror-side state, optional UI, and module notifications |
 | `node_helper.js` | Polls the external status file and forwards state into MagicMirror |
@@ -105,6 +106,21 @@ flowchart LR
 | PipeWire/WirePlumber | Routes audio to the Raspberry Pi's selected HDMI output |
 
 ## Operating sequence
+
+The daemon maintains independent `audioActive` and `videoActive` state. It
+derives the two handoffs from those flags:
+
+| Audio | Video | Receiver state | Pi volume | MagicMirror |
+| --- | --- | --- | --- | --- |
+| Inactive | Inactive | `READY` | Restored value | Running |
+| Active | Inactive | `STREAMING` (audio) | Temporary ceiling | Running |
+| Inactive | Active | `STREAMING` (mirroring) | Temporary ceiling | Stopped |
+| Active | Active | `STREAMING` (mirroring) | Temporary ceiling | Stopped |
+
+The volume handoff is active while either media stream is active. The display
+handoff is active only while video is active. This prevents audio-only playback
+from blanking the mirror and prevents either stream stopping early from
+restoring shared state while the other stream remains active.
 
 ### Service startup
 
@@ -118,37 +134,56 @@ flowchart LR
    is initialized.
 6. The daemon writes a `READY` status record. MagicMirror continues running.
 
-### Mirroring start
+### Audio-only streaming
+
+1. An Apple device selects `Art Wall` as an AirPlay audio destination.
+2. UxPlay emits `raop_rtp starting audio`.
+3. The stream tracker marks audio active and writes `STREAMING` with an
+   audio-specific status message.
+4. The volume manager reads and stores the PipeWire default-sink volume and
+   mute state, sets a 100% ceiling, and unmutes the sink.
+5. MagicMirror continues running because no video stream is active.
+6. UxPlay maps volume-button events onto the GStreamer stream gain.
+7. When UxPlay emits `raop_rtp exiting thread`, the daemon restores the saved Pi
+   volume and mute state.
+
+### Screen mirroring start
 
 1. An Apple device selects `Art Wall` and establishes an AirPlay session.
-2. UxPlay reports that mirroring has started.
-3. The daemon writes `STREAMING` to the runtime status file.
-4. A serialized session handoff performs two operations:
-   - The volume manager reads and stores the PipeWire default-sink volume and
-     mute state, sets a 100% ceiling, and unmutes the sink.
-   - PM2 stops the `MagicMirror` process.
-5. UxPlay renders video in a native fullscreen Wayland surface and sends audio
-   to the PipeWire-backed PulseAudio sink.
+2. UxPlay may start its audio stream before or after its video stream. The
+   daemon tracks both events without treating either as the complete session.
+3. `raop_rtp_mirror starting mirroring` marks video active and changes the
+   status message to screen mirroring.
+4. The volume handoff starts when the first audio or video stream becomes
+   active. A second start event does not overwrite the saved Pi volume.
+5. The video event causes PM2 to stop `MagicMirror`.
+6. UxPlay renders video in a native fullscreen Wayland surface and sends any
+   mirrored audio to the PipeWire-backed PulseAudio sink.
 
 ### Active mirroring
 
 The Apple device controls the AirPlay stream volume. UxPlay maps those volume
 events onto the GStreamer audio stream using the configured tapered gain curve.
-The Raspberry Pi master output remains at its temporary 100% ceiling throughout
-the session.
+The Raspberry Pi master output remains at its temporary 100% ceiling while any
+AirPlay audio or video stream remains active.
 
 Video is decoded and presented independently of MagicMirror. The receiver
 daemon stays active, monitors UxPlay, records selected format and performance
 messages, and waits for the disconnect event.
 
-### Mirroring end
+### Screen mirroring end
 
-1. UxPlay reports that the mirror stream has stopped.
-2. The daemon writes `READY` to the runtime status file.
-3. The serialized handoff restores the exact PipeWire volume and mute state
-   captured at session start.
-4. PM2 starts MagicMirror after volume restoration completes.
-5. UxPlay remains active and advertised for the next client.
+1. UxPlay reports video shutdown through its mirror reset or thread-exit
+   lifecycle messages.
+2. The tracker marks video inactive and PM2 starts MagicMirror.
+3. If an audio stream is still active, the receiver remains `STREAMING` and the
+   100% volume ceiling remains in effect.
+4. When the audio thread also exits, the tracker becomes fully inactive, the
+   daemon writes `READY`, and the saved PipeWire volume and mute state are
+   restored.
+5. If audio stops before video, the volume ceiling remains active until video
+   also stops and MagicMirror remains stopped until the video event ends.
+6. UxPlay remains active and advertised for the next client.
 
 ### Receiver or service shutdown
 
@@ -158,9 +193,9 @@ Normal `SIGINT`, `SIGTERM`, and uncaught-error shutdown paths also request
 volume restoration and MagicMirror startup. The systemd unit includes an
 `ExecStopPost` fallback that starts MagicMirror when the service stops.
 
-Duplicate lifecycle messages are idempotent. A second `STREAMING` event cannot
-replace the saved pre-session volume with the temporary 100% value, and a
-second `READY` event does not repeat the restoration.
+Duplicate lifecycle messages are idempotent. Repeated audio or video start
+events cannot replace the saved pre-session volume with the temporary 100%
+value, and repeated stop events do not repeat restoration or PM2 operations.
 
 Like any in-memory cleanup mechanism, restoration cannot run after an immediate
 power loss or `SIGKILL`.
@@ -203,7 +238,7 @@ not make the resulting video window non-fullscreen.
 
 ### Audio rendering
 
-UxPlay passes mirrored audio through GStreamer to:
+UxPlay passes both audio-only AirPlay and mirrored audio through GStreamer to:
 
 ```text
 pulsesink sync=false async=false buffer-time=20000 latency-time=10000 processing-deadline=0
@@ -235,29 +270,30 @@ PipeWire master-volume slider.
 
 ### Raspberry Pi volume ceiling
 
-The effective output during mirroring has two stages:
+The effective output during any active AirPlay media session has two stages:
 
 ```text
 audible output = temporary Pi system ceiling × AirPlay stream gain
 ```
 
 The daemon uses `wpctl` to make the full Pi output range available while the
-Apple device controls the stream:
+Apple device controls an audio-only or mirrored stream:
 
 1. Run `wpctl get-volume @DEFAULT_AUDIO_SINK@`.
 2. Parse and save both the scalar volume and `[MUTED]` state.
 3. Set the default sink to the configured limit with `wpctl set-volume -l`.
 4. Unmute the default sink with `wpctl set-mute ... 0`.
-5. On disconnect, restore the saved scalar volume.
+5. After the last active audio or video stream ends, restore the saved scalar
+   volume.
 6. Restore the saved mute state.
 
 For the checked-in configuration, an idle Pi volume of 40% transitions as
 follows:
 
 ```text
-before mirroring: 40%
-during mirroring: 100% system ceiling × Apple-controlled stream gain
-after mirroring:  40%
+before AirPlay: 40%
+during AirPlay: 100% system ceiling × Apple-controlled stream gain
+after AirPlay:  40%
 ```
 
 The volume manager logs command or parsing errors and allows mirroring to
@@ -486,6 +522,6 @@ npm run check
 ```
 
 The tests cover UxPlay argument generation, graphical-session discovery,
-lifecycle parsing, pairing, hardware-accelerated fullscreen rendering, volume
-configuration, duplicate session events, mute-state handling, and exact volume
-restoration.
+lifecycle parsing, independent audio/video state, pairing, hardware-accelerated
+fullscreen rendering, volume configuration, duplicate session events,
+mute-state handling, and exact volume restoration.
