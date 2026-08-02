@@ -22,6 +22,9 @@
     "v4l2h264dec capture-io-mode=mmap output-io-mode=mmap",
     "-vc",
     "videoconvert",
+    "-db",
+    "-50:0",
+    "-taper",
     "-srgb",
     "no"
   ],
@@ -31,6 +34,10 @@
   "manageMagicMirror": true,
   "pm2Path": "/usr/local/bin/pm2",
   "pm2ProcessName": "MagicMirror",
+  "manageSystemVolume": true,
+  "systemVolumeLimitPercent": 100,
+  "systemVolumeTarget": "@DEFAULT_AUDIO_SINK@",
+  "wpctlPath": "/usr/bin/wpctl",
   "receiverOutputSampleLines": 0,
   "performanceReportSamples": 3,
   "debugReceiver": true

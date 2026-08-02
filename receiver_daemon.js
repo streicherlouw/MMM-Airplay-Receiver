@@ -6,6 +6,7 @@ const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const { buildReceiverEnvironment, buildUxplayArgs, normalizeConfig } = require("./lib/uxplay");
 const { classifyDaemonLine } = require("./lib/daemon-events");
+const { SystemVolumeManager } = require("./lib/system-volume");
 
 const execFileAsync = promisify(execFile);
 const configurationPath = path.resolve(process.argv[2] || path.join(__dirname, "receiver-daemon.config.json"));
@@ -31,6 +32,7 @@ let restartTimer = null;
 let shuttingDown = false;
 let magicMirrorStopped = false;
 let pm2Queue = Promise.resolve();
+let handoffQueue = Promise.resolve();
 let lastState = null;
 let receiverOutputLinesRemaining = 0;
 let performanceReportsRemaining = 0;
@@ -39,6 +41,16 @@ let capturingPerformanceReport = false;
 function log(message) {
   console.log(`[MMM-Airplay-Receiver daemon] ${message}`);
 }
+
+const systemVolume = new SystemVolumeManager(
+  daemonConfig,
+  (command, args) => execFileAsync(command, args, {
+    env: process.env,
+    timeout: 5000,
+    maxBuffer: 1024 * 1024
+  }),
+  log
+);
 
 function writeStatus(state, message) {
   const status = {
@@ -79,6 +91,21 @@ function queueMagicMirror(shouldRun) {
   return pm2Queue;
 }
 
+function queueSessionHandoff(streaming) {
+  handoffQueue = handoffQueue.then(async () => {
+    if (streaming) {
+      await Promise.all([systemVolume.beginSession(), queueMagicMirror(false)]);
+      return;
+    }
+
+    await systemVolume.endSession();
+    await queueMagicMirror(true);
+  }).catch((error) => {
+    log(`Session handoff failed: ${error.message}`);
+  });
+  return handoffQueue;
+}
+
 function handleReceiverLine(line) {
   const text = String(line).trim();
   if (!text) return;
@@ -91,9 +118,9 @@ function handleReceiverLine(line) {
       receiverOutputLinesRemaining = receiverOutputSampleLines;
       performanceReportsRemaining = performanceReportSamples;
       capturingPerformanceReport = false;
-      queueMagicMirror(false);
+      queueSessionHandoff(true);
     }
-    if (event.state === "READY") queueMagicMirror(true);
+    if (event.state === "READY") queueSessionHandoff(false);
     return;
   }
 
@@ -185,7 +212,7 @@ function startReceiver() {
   child.once("error", (error) => {
     if (receiver === child) receiver = null;
     writeStatus("ERROR", `Could not start UxPlay: ${error.message}`);
-    queueMagicMirror(true);
+    queueSessionHandoff(false);
     scheduleReceiverRestart();
   });
 
@@ -195,7 +222,7 @@ function startReceiver() {
     const reason = signal ? `signal ${signal}` : `exit code ${code}`;
     writeStatus("ERROR", `UxPlay stopped (${reason})`);
     log(`UxPlay stopped (${reason})`);
-    queueMagicMirror(true);
+    queueSessionHandoff(false);
     scheduleReceiverRestart();
   });
 }
@@ -206,7 +233,7 @@ async function shutdown(signal) {
   log(`Stopping after ${signal}`);
   if (restartTimer) clearTimeout(restartTimer);
   if (receiver) receiver.kill("SIGTERM");
-  await queueMagicMirror(true);
+  await queueSessionHandoff(false);
   process.exit(0);
 }
 
@@ -214,7 +241,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("uncaughtException", async (error) => {
   log(`Uncaught error: ${error.stack || error.message}`);
-  await queueMagicMirror(true);
+  await queueSessionHandoff(false);
   process.exit(1);
 });
 

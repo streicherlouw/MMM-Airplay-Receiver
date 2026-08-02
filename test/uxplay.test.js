@@ -88,7 +88,10 @@ test("Art Wall daemon uses explicit Pi hardware decoding and native Wayland full
   assert.ok(args.includes("1920x1080@60"));
   assert.deepEqual(args.slice(args.indexOf("-vsync"), args.indexOf("-vsync") + 2), ["-vsync", "no"]);
   assert.ok(args.includes("-FPSdata"));
+  assert.deepEqual(args.slice(args.indexOf("-db"), args.indexOf("-db") + 3), ["-db", "-50:0", "-taper"]);
   assert.equal(daemonConfig.fps, 60);
+  assert.equal(daemonConfig.manageSystemVolume, true);
+  assert.equal(daemonConfig.systemVolumeLimitPercent, 100);
   assert.match(daemonConfig.videoSink, /sync=false/);
   assert.match(daemonConfig.videoSink, /fullscreen=true/);
   assert.ok(!args.includes("-fs"));

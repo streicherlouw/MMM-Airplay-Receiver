@@ -35,9 +35,12 @@ flowchart LR
     Apple["iPhone, iPad, or Mac"] -->|"AirPlay over Wi-Fi"| UxPlay["UxPlay receiver"]
     UxPlay --> Decode["V4L2 H.264 hardware decoder"]
     Decode --> Wayland["Native fullscreen Wayland surface"]
+    UxPlay --> Gain["AirPlay-controlled stream gain"]
+    Gain --> PipeWire["PipeWire HDMI output"]
     Daemon["External receiver daemon"] --> UxPlay
     Daemon -->|"stream starts: stop"| PM2["PM2 / MagicMirror"]
     Daemon -->|"stream ends: start"| PM2
+    Daemon -->|"save, set 100%, restore"| PipeWire
     Daemon --> Status["Runtime status file"]
     Status --> Module["MagicMirror integration module"]
 ```
@@ -77,6 +80,18 @@ and it does not rely on the Raspberry Pi desktop window layout. This gives the
 stream the whole display, including the area normally occupied by desktop
 panels or MagicMirror.
 
+### How do the Apple device's volume buttons work?
+
+UxPlay receives the AirPlay volume selected by the connected device and maps it
+onto the GStreamer audio stream with a tapered gain curve. The phone or tablet
+therefore controls the audible mirroring volume.
+
+At the start of a session, the daemon reads and saves the current PipeWire
+default-sink volume and mute state. It sets that sink to an unmuted 100% ceiling
+while UxPlay applies the client-controlled stream gain. At the end of the
+session, the daemon restores the saved Pi volume and mute state. Duplicate
+stream events do not overwrite the saved state.
+
 ### What does the MagicMirror module do?
 
 In external-service mode, the module does not launch UxPlay. Its node helper
@@ -94,20 +109,25 @@ react to AirPlay activity.
 3. UxPlay advertises `Art Wall` on the local network.
 4. A user selects `Art Wall` from Screen Mirroring.
 5. UxPlay establishes the stream and creates the fullscreen Wayland surface.
-6. The daemon marks the state as `STREAMING` and stops MagicMirror through PM2.
-7. GStreamer decodes and renders frames until the client disconnects.
-8. The daemon marks the state as `READY` and starts MagicMirror again.
-9. UxPlay remains advertised for the next session.
+6. The daemon marks the state as `STREAMING`, saves the Pi volume, sets the HDMI
+   sink to 100%, and stops MagicMirror through PM2.
+7. GStreamer decodes and renders the stream; the Apple device controls its
+   audio gain.
+8. When the client disconnects, the daemon restores the Pi volume and mute
+   state.
+9. The daemon marks the state as `READY` and starts MagicMirror again.
+10. UxPlay remains advertised for the next session.
 
 ## Component responsibilities
 
 | Component | Responsibility |
 | --- | --- |
 | `systemd/mmm-airplay-receiver.service` | Starts, supervises, and restarts the external receiver daemon |
-| `receiver_daemon.js` | Owns UxPlay, interprets stream events, writes status, and controls MagicMirror through PM2 |
-| `receiver-daemon.config.json` | Defines the receiver, display, audio, performance, and PM2 profile |
+| `receiver_daemon.js` | Owns UxPlay, interprets stream events, writes status, and coordinates MagicMirror and volume handoffs |
+| `receiver-daemon.config.json` | Defines the receiver, display, audio, volume, performance, and PM2 profile |
 | `lib/uxplay.js` | Validates configuration and builds the UxPlay command and environment |
 | `lib/daemon-events.js` | Converts UxPlay output into `READY` and `STREAMING` lifecycle events |
+| `lib/system-volume.js` | Saves, caps, unmutes, and restores the PipeWire default-sink volume |
 | `MMM-Airplay-Receiver.js` | Provides the MagicMirror-side integration and notifications |
 | `node_helper.js` | Monitors external status or, in optional in-process mode, owns UxPlay directly |
 | UxPlay | Implements the AirPlay receiver and creates the GStreamer pipeline |
@@ -131,6 +151,9 @@ The included `receiver-daemon.config.json` defines the Art Wall profile:
 | Fullscreen owner | `waylandsink fullscreen=true` | Gives the stream the complete display |
 | Video timing | `-vsync no`, `sync=false`, `async=false` | Presents received frames without adding a playback queue |
 | Audio sink | Low-buffer `pulsesink` | Sends audio to the graphical session with minimal buffering |
+| AirPlay volume curve | `-db -50:0 -taper` | Maps device volume buttons onto a useful tapered stream-gain range |
+| Pi volume ceiling | `100%` | Makes the full HDMI output range available during mirroring |
+| Volume restoration | Enabled | Returns the previous Pi volume and mute state after mirroring |
 | Pairing | `pin: false` | Allows normal clients without mandatory PIN entry |
 | MagicMirror handoff | `manageMagicMirror: true` | Stops and starts the configured PM2 process automatically |
 
@@ -155,6 +178,20 @@ The same immediate-rendering profile is used for iPhone, iPad, and Mac clients.
 It prioritizes screen-response latency and cross-device behavior over building
 a larger timestamp-synchronized playback buffer.
 
+The system-volume handoff is configured with:
+
+```json
+{
+  "manageSystemVolume": true,
+  "systemVolumeLimitPercent": 100,
+  "systemVolumeTarget": "@DEFAULT_AUDIO_SINK@",
+  "wpctlPath": "/usr/bin/wpctl"
+}
+```
+
+`systemVolumeLimitPercent` accepts values from 1 through 100. The configured
+limit is passed to `wpctl` as both the requested volume and the command ceiling.
+
 ## Platform and network
 
 The reference installation uses:
@@ -177,6 +214,7 @@ for 1080p60 mirroring.
 - MagicMirror²
 - Node.js 18 or newer
 - PM2 managing MagicMirror
+- PipeWire/WirePlumber with `wpctl`
 - A Debian-based Raspberry Pi installation with a graphical session
 - SSH key authentication for remote deployment
 
@@ -238,11 +276,12 @@ pm2 restart MagicMirror
 ```
 
 The service unit calls `/usr/local/bin/node`, and the daemon configuration calls
-`/usr/local/bin/pm2`. Check both paths before installation:
+`/usr/local/bin/pm2` and `/usr/bin/wpctl`. Check the paths before installation:
 
 ```bash
 command -v node
 command -v pm2
+command -v wpctl
 ```
 
 Update the service or daemon configuration when the commands are installed in
@@ -328,6 +367,13 @@ Hardware decoder availability:
 gst-inspect-1.0 v4l2h264dec
 ```
 
+PipeWire output and current system volume:
+
+```bash
+wpctl status
+wpctl get-volume @DEFAULT_AUDIO_SINK@
+```
+
 Wayland session values used by the reference configuration:
 
 ```text
@@ -353,5 +399,5 @@ npm run check
 ```
 
 The tests cover UxPlay argument generation, Wayland environment discovery,
-lifecycle parsing, PIN handling, and the reference hardware-accelerated
-fullscreen profile.
+lifecycle parsing, PIN handling, system-volume capture and restoration, and
+the reference hardware-accelerated fullscreen profile.
