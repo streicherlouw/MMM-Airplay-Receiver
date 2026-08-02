@@ -1,0 +1,16 @@
+[Unit]
+Description=MagicMirror AirPlay receiver
+After=network-online.target graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/MagicMirror/modules/MMM-Airplay-Receiver
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=/usr/local/bin/node %h/MagicMirror/modules/MMM-Airplay-Receiver/receiver_daemon.js %h/MagicMirror/modules/MMM-Airplay-Receiver/receiver-daemon.config.json
+ExecStopPost=-/usr/local/bin/pm2 start MagicMirror
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

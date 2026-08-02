@@ -1,0 +1,58 @@
+.airplay-receiver {
+  min-width: 300px;
+  max-width: 430px;
+}
+
+.airplay-hidden {
+  display: none;
+}
+
+.airplay-status-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.airplay-icon {
+  width: 42px;
+  color: #fff;
+  font-size: 38px;
+  line-height: 1;
+  text-align: center;
+}
+
+.airplay-copy {
+  text-align: left;
+}
+
+.airplay-title {
+  font-size: 24px;
+  line-height: 1.25;
+}
+
+.airplay-detail {
+  max-width: 360px;
+  margin-top: 4px;
+  line-height: 1.35;
+}
+
+.airplay-pin {
+  margin-top: 14px;
+  padding: 8px 16px;
+  border: 1px solid rgb(255 255 255 / 45%);
+  border-radius: 8px;
+  font-size: 48px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.3em;
+  text-align: center;
+  text-indent: 0.3em;
+}
+
+.airplay-error .airplay-icon,
+.airplay-error .airplay-title {
+  color: #ff7070;
+}
+
+.airplay-streaming .airplay-icon {
+  color: #64d2ff;
+}
