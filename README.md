@@ -1,16 +1,34 @@
 # MMM-Airplay-Receiver
 
-Mirror an iPhone, iPad, or Mac to a MagicMirror display on Raspberry Pi using
-[UxPlay](https://github.com/FDH2/UxPlay). The final design runs UxPlay as an
-independent `systemd` user service, temporarily stops MagicMirror while a
-client is mirroring, and renders the AirPlay video directly into a native
-fullscreen Wayland surface.
+`MMM-Airplay-Receiver` adds AirPlay screen mirroring to a MagicMirror display
+on Raspberry Pi. An iPhone, iPad, or Mac can select the mirror from the normal
+Screen Mirroring menu and take over the display for the duration of the
+session. When sharing stops, MagicMirror returns automatically.
 
-The tested Art Wall profile uses 1920×1080 at 60 fps, Raspberry Pi V4L2 H.264
-hardware decoding, low-latency rendering, and no mandatory PIN. It has been
-verified with iPhone, iPad, and macOS screen mirroring over Wi-Fi.
+The module uses [UxPlay](https://github.com/FDH2/UxPlay) as the AirPlay
+receiver and GStreamer as the hardware-accelerated video pipeline.
 
-## Final architecture
+## What are we building?
+
+Let us describe the design as if we were explaining it to a rubber duck.
+
+The mirror has two jobs:
+
+1. Show MagicMirror during normal operation.
+2. Show an AirPlay stream fullscreen when an Apple device connects.
+
+AirPlay discovery must remain available while MagicMirror is running, and the
+receiver must keep running when MagicMirror gives up the display. The video
+should go directly to the Raspberry Pi's native graphics stack rather than
+through MagicMirror's browser window.
+
+Those requirements lead to three separate responsibilities:
+
+- A background service owns the AirPlay receiver.
+- A receiver daemon coordinates the screen handoff.
+- A MagicMirror module observes the receiver and publishes integration events.
+
+## Solution architecture
 
 ```mermaid
 flowchart LR
@@ -24,130 +42,99 @@ flowchart LR
     Status --> Module["MagicMirror integration module"]
 ```
 
-The external service is important. If UxPlay were a child of MagicMirror,
-stopping MagicMirror to free the display would also terminate the active
-AirPlay session. Keeping the receiver in a separate service allows this
-lifecycle instead:
+## Rubber-duck walkthrough
 
-1. The receiver stays advertised while MagicMirror is running.
-2. An Apple device begins mirroring.
-3. The daemon detects UxPlay's streaming event and stops the `MagicMirror` PM2
-   process.
-4. `waylandsink` covers the complete display; no Raspberry Pi desktop or
-   MagicMirror content remains visible.
-5. When mirroring ends, the daemon starts MagicMirror again.
-6. If UxPlay exits unexpectedly, the service restores MagicMirror and restarts
-   the receiver.
+### Who keeps AirPlay available?
 
-The MagicMirror module remains installed so other modules can consume receiver
-status notifications. Its on-screen availability tile is disabled by default.
+The `mmm-airplay-receiver.service` user service starts
+`receiver_daemon.js`. The daemon starts UxPlay and keeps it running
+independently from MagicMirror.
 
-## Tested platform
+UxPlay advertises the configured receiver name with Avahi/mDNS. This is why
+the mirror appears in the Screen Mirroring list even though the MagicMirror UI
+does not display an AirPlay status message.
 
-- Raspberry Pi 4 running Raspberry Pi OS Bookworm
-- Native Wayland/labwc graphical session
-- MagicMirror managed by PM2 as `MagicMirror`
-- Node.js and PM2 installed under `/usr/local/bin`
-- UxPlay 1.73.6
-- Wi-Fi-only network connection
-- iPhone, iPad, and Mac AirPlay clients
+### Who decides what owns the screen?
 
-Other Linux, compositor, or process-manager combinations may require path and
-sink changes described below.
+The daemon reads UxPlay's lifecycle output.
 
-## Requirements
+- When UxPlay is ready, MagicMirror is allowed to run.
+- When mirroring starts, the daemon asks PM2 to stop `MagicMirror`.
+- When mirroring ends, the daemon asks PM2 to start `MagicMirror`.
+- When the service stops, its systemd cleanup also starts MagicMirror.
 
-- Raspberry Pi OS or another Debian-based Linux installation with a graphical
-  session
-- MagicMirror² and Node.js 18 or newer
-- PM2 managing MagicMirror for the automatic display handoff
-- UxPlay and the required GStreamer plugins
-- Avahi/mDNS for AirPlay discovery
-- The Pi and Apple device on the same local network
-- SSH key authentication when deploying from another computer
+The daemon remains alive throughout the handoff, so the AirPlay connection and
+the process controlling MagicMirror do not depend on one another.
 
-For a Wi-Fi-only Pi, prefer a strong 5 GHz connection, keep the Pi and client
-near the same access point, and avoid a congested channel. Network jitter can
-still cause choppy playback even when hardware decoding is working correctly.
+### How does video reach the display?
 
-## Deploy to the Pi
+UxPlay receives the AirPlay H.264 stream and passes it to GStreamer. The
+pipeline uses the Raspberry Pi's V4L2 H.264 decoder, converts the decoded
+frames into a displayable format, and sends them to a native Wayland sink.
 
-The deployment script copies the module without reading or replacing the
-MagicMirror configuration, which may contain private calendars and tokens.
+The Wayland sink owns a fullscreen surface. It is not embedded in MagicMirror
+and it does not rely on the Raspberry Pi desktop window layout. This gives the
+stream the whole display, including the area normally occupied by desktop
+panels or MagicMirror.
 
-From this repository on the development machine:
+### What does the MagicMirror module do?
 
-```bash
-./scripts/deploy.sh --install-uxplay streicher@artwall1.local
-```
+In external-service mode, the module does not launch UxPlay. Its node helper
+polls the daemon's JSON status file once per second and forwards lifecycle
+changes to MagicMirror as notifications.
 
-Omit `--install-uxplay` after UxPlay has been installed once. The installer
-builds the pinned, tested UxPlay 1.73.6 release, installs its Debian and
-GStreamer dependencies, and enables Avahi.
+The visible module tile is disabled with `showStatus: false`. The module still
+provides integration state for any other MagicMirror module that wants to
+react to AirPlay activity.
 
-Add this entry to the `modules` array in
-`~/MagicMirror/config/config.js` on the Pi:
+### What happens during one session?
 
-```js
-{
-  module: "MMM-Airplay-Receiver",
-  position: "top_center",
-  config: {
-    receiverName: "Art Wall",
-    externalService: true,
-    externalStatusFile: "/run/user/1000/mmm-airplay-receiver-status.json",
-    pin: false,
-    showStatus: false
-  }
-},
-```
+1. systemd starts the receiver daemon with the graphical-session environment.
+2. The daemon starts UxPlay.
+3. UxPlay advertises `Art Wall` on the local network.
+4. A user selects `Art Wall` from Screen Mirroring.
+5. UxPlay establishes the stream and creates the fullscreen Wayland surface.
+6. The daemon marks the state as `STREAMING` and stops MagicMirror through PM2.
+7. GStreamer decodes and renders frames until the client disconnects.
+8. The daemon marks the state as `READY` and starts MagicMirror again.
+9. UxPlay remains advertised for the next session.
 
-The numeric user ID in `externalStatusFile` is `1000` on the tested Pi. Check
-it with `id -u` and adjust the path if the MagicMirror user has a different ID.
+## Component responsibilities
 
-Install and start the independent receiver service:
+| Component | Responsibility |
+| --- | --- |
+| `systemd/mmm-airplay-receiver.service` | Starts, supervises, and restarts the external receiver daemon |
+| `receiver_daemon.js` | Owns UxPlay, interprets stream events, writes status, and controls MagicMirror through PM2 |
+| `receiver-daemon.config.json` | Defines the receiver, display, audio, performance, and PM2 profile |
+| `lib/uxplay.js` | Validates configuration and builds the UxPlay command and environment |
+| `lib/daemon-events.js` | Converts UxPlay output into `READY` and `STREAMING` lifecycle events |
+| `MMM-Airplay-Receiver.js` | Provides the MagicMirror-side integration and notifications |
+| `node_helper.js` | Monitors external status or, in optional in-process mode, owns UxPlay directly |
+| UxPlay | Implements the AirPlay receiver and creates the GStreamer pipeline |
+| GStreamer | Decodes, converts, and renders the audio/video stream |
+| Avahi | Publishes the receiver over mDNS |
+| PM2 | Runs MagicMirror and accepts the daemon's stop/start handoff |
 
-```bash
-ssh streicher@artwall1.local
-cd ~/MagicMirror/modules/MMM-Airplay-Receiver
-./scripts/install-service.sh
-pm2 restart MagicMirror
-```
+## Reference rendering profile
 
-The provided unit expects `node` and `pm2` at `/usr/local/bin/node` and
-`/usr/local/bin/pm2`. Verify those paths with `command -v node` and
-`command -v pm2`; update the service file and `receiver-daemon.config.json`
-before installing if they differ.
+The included `receiver-daemon.config.json` defines the Art Wall profile:
 
-After a later deployment, restart the already-installed receiver so it loads
-the new code and configuration:
-
-```bash
-ssh streicher@artwall1.local \
-  systemctl --user restart mmm-airplay-receiver.service
-```
-
-## Final receiver profile
-
-The performance and display settings live in
-`receiver-daemon.config.json`, not in the MagicMirror module entry. The checked
-in profile is the profile proven on Art Wall:
-
-| Setting | Final value | Reason |
+| Setting | Value | Design intent |
 | --- | --- | --- |
-| `resolution` | `1920x1080@60` | High-quality 1080p stream with a 60 Hz target |
-| `fps` | `60` | Smooth video and desktop motion |
-| `lowLatency` | `true` | Uses UxPlay `-vsync no` to avoid queued frames and Mac resize failures |
-| `fullscreen` | `false` | Avoids UxPlay's generic `-fs`; native Wayland fullscreen is set on the sink |
-| `videoSink` | `waylandsink fullscreen=true sync=false async=false …` | Covers the complete output and renders frames immediately |
-| `audioSink` | low-buffer `pulsesink` | Reduces audio buffering latency |
-| decoder | `v4l2h264dec …-io-mode=mmap` | Uses Pi H.264 hardware decoding with stable buffer negotiation |
-| converter | `videoconvert` | Uses the reliable software color-conversion stage after hardware decode |
-| `useBt709` | `true` | Applies the Pi 4 color handling required by this display path |
-| `pin` | `false` | Does not require PIN pairing for normal clients |
-| `manageMagicMirror` | `true` | Enables automatic PM2 stop/start handoff |
+| Receiver name | `Art Wall` | Friendly name in Apple's Screen Mirroring menu |
+| Resolution | `1920x1080@60` | Full-HD output with a 60 Hz stream target |
+| Advertised frame rate | `60` | Smooth video and desktop motion |
+| Video decoder | `v4l2h264dec` | Raspberry Pi H.264 hardware decoding |
+| Decoder I/O | `mmap` capture and output | Explicit V4L2 buffer allocation |
+| Video conversion | `videoconvert` | Converts decoded frames for the Wayland sink |
+| Video sink | `waylandsink` | Native rendering in the active Wayland session |
+| Fullscreen owner | `waylandsink fullscreen=true` | Gives the stream the complete display |
+| Video timing | `-vsync no`, `sync=false`, `async=false` | Presents received frames without adding a playback queue |
+| Audio sink | Low-buffer `pulsesink` | Sends audio to the graphical session with minimal buffering |
+| Pairing | `pin: false` | Allows normal clients without mandatory PIN entry |
+| MagicMirror handoff | `manageMagicMirror: true` | Stops and starts the configured PM2 process automatically |
 
-The complete configured video sink is:
+The complete video sink string is:
 
 ```text
 waylandsink fullscreen=true sync=false async=false enable-last-sample=false processing-deadline=0
@@ -160,47 +147,78 @@ The decoder and converter arguments are:
 -vc videoconvert
 ```
 
-Hardware decoding remains enabled. Only color conversion is performed by the
-CPU. The explicit `mmap` modes avoid the V4L2 buffer-negotiation failure seen
-with automatic I/O selection on the tested Pi.
+`fullscreen` is set to `false` in the daemon configuration because that option
+controls UxPlay's generic `-fs` flag. Fullscreen ownership belongs to the native
+Wayland sink in this architecture.
 
-### Why immediate rendering is retained
+The same immediate-rendering profile is used for iPhone, iPad, and Mac clients.
+It prioritizes screen-response latency and cross-device behavior over building
+a larger timestamp-synchronized playback buffer.
 
-Timestamp-synchronized playback can look smooth in a stable video stream, but
-it increases delay and caused macOS mirroring to fail during the desktop resize
-performed while establishing a session. The final unified profile therefore
-uses UxPlay `-vsync no` together with `sync=false` on both sinks. This profile
-works across the tested iPhone, iPad, and Mac clients and keeps interaction
-latency low.
+## Platform and network
 
-## PIN behaviour
+The reference installation uses:
 
-PIN pairing is disabled by default and is not required for the tested clients.
-UxPlay can still accommodate a managed client that requests pairing for
-compatibility.
+- Raspberry Pi 4 with Raspberry Pi OS Bookworm
+- Native Wayland/labwc graphical session
+- MagicMirror managed by PM2 as `MagicMirror`
+- Node.js and PM2 under `/usr/local/bin`
+- UxPlay 1.73.6
+- Wi-Fi network connection
 
-To force a one-time PIN for each new client, set `pin` to `true`. To use a
-fixed PIN, set a four-digit string such as `"4821"`. Only enable
-`persistTrustedClients` when PIN pairing is in use.
+The Pi and AirPlay client must be on the same local network, with multicast
+traffic allowed between them. A stable 5 GHz Wi-Fi connection is recommended
+for 1080p60 mirroring.
 
-## MagicMirror integration options
+## Install and deploy
 
-These options belong in the module's `config.js` entry:
+### Requirements
 
-| Option | Recommended value | Meaning |
-| --- | --- | --- |
-| `receiverName` | `"Art Wall"` | Name shown in the Screen Mirroring list |
-| `externalService` | `true` | Monitor the independent receiver rather than launching UxPlay inside MagicMirror |
-| `externalStatusFile` | `/run/user/1000/mmm-airplay-receiver-status.json` | Runtime state written by the daemon |
-| `showStatus` | `false` | Keeps the AirPlay availability/status message off the mirror |
-| `pin` | `false` | No mandatory PIN pairing |
+- MagicMirror²
+- Node.js 18 or newer
+- PM2 managing MagicMirror
+- A Debian-based Raspberry Pi installation with a graphical session
+- SSH key authentication for remote deployment
 
-The repository retains an in-process mode for simpler installations. With
-`externalService: false`, the MagicMirror node helper launches UxPlay itself.
-That mode does not support stopping MagicMirror during an active session and is
-not the final Art Wall design.
+### Copy the module and install UxPlay
 
-The configuration helpers preserve timestamped backups:
+From the development machine:
+
+```bash
+./scripts/deploy.sh --install-uxplay streicher@artwall1.local
+```
+
+The `--install-uxplay` option installs build dependencies, builds the pinned
+UxPlay 1.73.6 release, installs the required GStreamer plugins, and enables
+Avahi. Omit it on later deployments.
+
+The deploy script copies only this module. It does not read or replace
+MagicMirror's `config.js`.
+
+### Configure the MagicMirror integration
+
+Add this entry to the `modules` array in
+`~/MagicMirror/config/config.js` on the Pi:
+
+```js
+{
+  module: "MMM-Airplay-Receiver",
+  position: "top_center",
+  config: {
+    receiverName: "Art Wall",
+    externalService: true,
+    externalStatusFile: "/run/user/1000/mmm-airplay-receiver-status.json",
+    showStatus: false
+  }
+},
+```
+
+The receiver name should match the name in `receiver-daemon.config.json`.
+The `/run/user/1000` path assumes that the graphical user ID is `1000`; use
+`id -u` on the Pi to check it.
+
+The included helpers can add or update the module entry while retaining a
+timestamped backup:
 
 ```bash
 node scripts/enable-module.mjs ~/MagicMirror/config/config.js "Art Wall" waylandsink
@@ -209,106 +227,108 @@ node scripts/update-module-config.mjs ~/MagicMirror/config/config.js \
   '{"externalService":true,"externalStatusFile":"/run/user/1000/mmm-airplay-receiver-status.json","showStatus":false}'
 ```
 
-## Operating the receiver
+### Install the receiver service
 
-Check the receiver and MagicMirror processes:
+On the Pi:
+
+```bash
+cd ~/MagicMirror/modules/MMM-Airplay-Receiver
+./scripts/install-service.sh
+pm2 restart MagicMirror
+```
+
+The service unit calls `/usr/local/bin/node`, and the daemon configuration calls
+`/usr/local/bin/pm2`. Check both paths before installation:
+
+```bash
+command -v node
+command -v pm2
+```
+
+Update the service or daemon configuration when the commands are installed in
+different locations.
+
+### Deploy an update
+
+From the development machine:
+
+```bash
+./scripts/deploy.sh streicher@artwall1.local
+ssh streicher@artwall1.local \
+  systemctl --user restart mmm-airplay-receiver.service
+```
+
+## Pairing policy
+
+PIN pairing is disabled in `receiver-daemon.config.json`. A client can begin
+mirroring without entering a code.
+
+Set `pin` to `true` for a generated PIN, or use a four-digit string such as
+`"4821"` for a fixed PIN. `persistTrustedClients` is relevant only when PIN
+pairing is enabled.
+
+## Runtime state and notifications
+
+The daemon atomically writes its current state to:
+
+```text
+/run/user/1000/mmm-airplay-receiver-status.json
+```
+
+The state is one of `STARTING`, `READY`, `STREAMING`, `ERROR`, or `STOPPED`.
+The MagicMirror module republishes changes as:
+
+- `AIRPLAY_RECEIVER_STATUS`
+- `AIRPLAY_RECEIVER_PIN`
+
+The repository also supports an in-process mode with
+`externalService: false`. In that mode, `node_helper.js` starts UxPlay and
+accepts `AIRPLAY_RECEIVER_START`, `AIRPLAY_RECEIVER_STOP`, and
+`AIRPLAY_RECEIVER_RESTART`. The external-service architecture does not use
+those control notifications; systemd owns the receiver process.
+
+## Operations
+
+Check service and MagicMirror state:
 
 ```bash
 systemctl --user status mmm-airplay-receiver.service
 pm2 status
 ```
 
-Follow receiver logs while connecting a device:
+Follow the receiver lifecycle and GStreamer output:
 
 ```bash
 journalctl --user -u mmm-airplay-receiver.service -f
 ```
 
-Inspect the last published integration state:
+Read the latest integration state:
 
 ```bash
 cat /run/user/1000/mmm-airplay-receiver-status.json
 ```
 
-Restart the receiver without rebooting the Pi:
+Restart the receiver:
 
 ```bash
 systemctl --user restart mmm-airplay-receiver.service
 ```
 
-## Notifications
+## Health checks
 
-The MagicMirror module broadcasts:
-
-- `AIRPLAY_RECEIVER_STATUS` for receiver lifecycle changes
-- `AIRPLAY_RECEIVER_PIN` when UxPlay requests a PIN
-
-In in-process mode, other modules can send `AIRPLAY_RECEIVER_START`,
-`AIRPLAY_RECEIVER_STOP`, or `AIRPLAY_RECEIVER_RESTART`. Those controls are
-ignored in external-service mode; use `systemctl --user` to control the daemon.
-
-## Troubleshooting
-
-### Receiver is not visible
+AirPlay discovery:
 
 ```bash
 systemctl status avahi-daemon
 ```
 
-Confirm that the Pi and client are on the same LAN and that multicast UDP 5353
-is not isolated by the Wi-Fi access point.
-
-### A client connects and immediately disconnects
-
-Follow the service journal during the attempt. Confirm that TCP and UDP ports
-7000–7002 are allowed and that UxPlay remains running:
-
-```bash
-journalctl --user -u mmm-airplay-receiver.service -f
-```
-
-### The Pi desktop remains visible around the stream
-
-Verify all three parts of the final handoff:
-
-- `manageMagicMirror` is `true` and the PM2 process is named `MagicMirror`.
-- `fullscreen` is `false` in the daemon config, avoiding the generic UxPlay
-  fullscreen mode.
-- `videoSink` contains `waylandsink fullscreen=true`.
-
-The native sink property—not UxPlay `-fs`—is what guarantees a complete
-Wayland fullscreen surface in this design.
-
-### Hardware decoding fails
-
-Confirm the decoder is installed and inspect the receiver journal:
+Hardware decoder availability:
 
 ```bash
 gst-inspect-1.0 v4l2h264dec
-journalctl --user -u mmm-airplay-receiver.service -b
 ```
 
-Keep the explicit `capture-io-mode=mmap output-io-mode=mmap` settings on the
-tested Pi. If `v4l2h264dec` is unavailable, verify the Raspberry Pi GStreamer
-packages and `/dev/video*` devices before falling back to software decoding.
-
-### Video is choppy
-
-First check Wi-Fi signal quality and congestion, then look for dropped-frame or
-performance messages in the journal. Also verify that UxPlay is using
-`v4l2h264dec`, not a software H.264 decoder. As a fallback for a weaker network,
-try `1280x720@60` before reducing the frame rate.
-
-### Mac fails while resizing its desktop
-
-Restore the unified final profile: 1920×1080 at 60 fps, `lowLatency: true`, and
-`sync=false` on the video and audio sinks. Enabling timestamp synchronization
-can cause the transition frames emitted during macOS desktop resizing to be
-discarded as late.
-
-### UxPlay cannot open the display
-
-For the tested Wayland session, verify:
+Wayland session values used by the reference configuration:
 
 ```text
 XDG_RUNTIME_DIR=/run/user/1000
@@ -316,18 +336,22 @@ WAYLAND_DISPLAY=wayland-0
 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 ```
 
-Adjust the user ID or Wayland socket name when the graphical session uses
-different values.
+Network access requires multicast UDP 5353 for discovery and the configured
+UxPlay port range, 7000–7002 by default, for the receiver session.
 
-## Development checks
+For playback interruptions, check Wi-Fi signal quality and the receiver
+journal first. The daemon records stream format, decoder messages, and a small
+number of UxPlay performance reports for each session.
 
-Run the test suite and JavaScript syntax checks before deployment:
+## Development
+
+Run the tests and JavaScript syntax checks before deployment:
 
 ```bash
 npm test
 npm run check
 ```
 
-The tests cover argument generation, Wayland environment discovery, AirPlay
-lifecycle parsing, PIN handling, and the final Art Wall hardware-accelerated
+The tests cover UxPlay argument generation, Wayland environment discovery,
+lifecycle parsing, PIN handling, and the reference hardware-accelerated
 fullscreen profile.
