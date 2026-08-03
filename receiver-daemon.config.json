@@ -38,6 +38,9 @@
   "systemVolumeLimitPercent": 100,
   "systemVolumeTarget": "@DEFAULT_AUDIO_SINK@",
   "wpctlPath": "/usr/bin/wpctl",
+  "manageDisplayPower": true,
+  "displayOutput": "HDMI-A-1",
+  "wlrRandrPath": "/usr/bin/wlr-randr",
   "receiverOutputSampleLines": 0,
   "performanceReportSamples": 3,
   "debugReceiver": true

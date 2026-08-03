@@ -45,6 +45,7 @@ scp \
   "$module_root/lib/uxplay.js" \
   "$module_root/lib/daemon-events.js" \
   "$module_root/lib/system-volume.js" \
+  "$module_root/lib/display-power.js" \
   "$remote:$remote_target/lib/"
 scp \
   "$module_root/scripts/install-uxplay.sh" \
@@ -71,6 +72,7 @@ ssh "$remote" node --check "$remote_target/receiver_daemon.js"
 ssh "$remote" node --check "$remote_target/lib/uxplay.js"
 ssh "$remote" node --check "$remote_target/lib/daemon-events.js"
 ssh "$remote" node --check "$remote_target/lib/system-volume.js"
+ssh "$remote" node --check "$remote_target/lib/display-power.js"
 
 if [[ "$restart_magicmirror" -eq 1 ]]; then
   ssh "$remote" sh -s <<'REMOTE_RESTART'

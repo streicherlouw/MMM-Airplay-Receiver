@@ -6,12 +6,14 @@ const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
 const { buildReceiverEnvironment, buildUxplayArgs, normalizeConfig } = require("./lib/uxplay");
 const { classifyDaemonLine, StreamLifecycle } = require("./lib/daemon-events");
+const { DisplayPowerManager } = require("./lib/display-power");
 const { SystemVolumeManager } = require("./lib/system-volume");
 
 const execFileAsync = promisify(execFile);
 const configurationPath = path.resolve(process.argv[2] || path.join(__dirname, "receiver-daemon.config.json"));
 const daemonConfig = JSON.parse(fs.readFileSync(configurationPath, "utf8"));
 const receiverConfig = normalizeConfig(daemonConfig);
+const receiverEnvironment = buildReceiverEnvironment(receiverConfig);
 const statusFile = daemonConfig.externalStatusFile || path.join(
   receiverConfig.xdgRuntimeDir || process.env.XDG_RUNTIME_DIR || "/tmp",
   "mmm-airplay-receiver-status.json"
@@ -46,6 +48,15 @@ const systemVolume = new SystemVolumeManager(
   daemonConfig,
   (command, args) => execFileAsync(command, args, {
     env: process.env,
+    timeout: 5000,
+    maxBuffer: 1024 * 1024
+  }),
+  log
+);
+const displayPower = new DisplayPowerManager(
+  daemonConfig,
+  (command, args) => execFileAsync(command, args, {
+    env: receiverEnvironment,
     timeout: 5000,
     maxBuffer: 1024 * 1024
   }),
@@ -94,8 +105,17 @@ function queueMagicMirror(shouldRun) {
 
 function queueSessionHandoff({ anyActive, videoActive }) {
   handoffQueue = handoffQueue.then(async () => {
-    if (anyActive) await systemVolume.beginSession();
-    else await systemVolume.endSession();
+    if (anyActive) {
+      await Promise.all([
+        systemVolume.beginSession(),
+        displayPower.beginSession()
+      ]);
+    } else {
+      await Promise.all([
+        systemVolume.endSession(),
+        displayPower.endSession()
+      ]);
+    }
 
     await queueMagicMirror(!videoActive);
   }).catch((error) => {
@@ -194,14 +214,13 @@ function startReceiver() {
     // which adds avoidable CPU and I/O load during live mirroring.
     if (daemonConfig.debugReceiver !== "full") uxplayArgs.push("1");
   }
-  const environment = buildReceiverEnvironment(receiverConfig);
   const stdbufPath = daemonConfig.stdbufPath || "/usr/bin/stdbuf";
   const commandArgs = ["-oL", "-eL", receiverConfig.uxplayPath, ...uxplayArgs];
 
   writeStatus("STARTING", `Starting ${receiverConfig.receiverName}`);
   log(`Launching ${receiverConfig.uxplayPath} ${uxplayArgs.join(" ")}`);
   const child = spawn(stdbufPath, commandArgs, {
-    env: environment,
+    env: receiverEnvironment,
     stdio: ["ignore", "pipe", "pipe"]
   });
   receiver = child;

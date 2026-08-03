@@ -13,6 +13,7 @@ The solution combines:
 - A systemd user service for receiver availability and supervision
 - PM2 for the MagicMirror display handoff
 - PipeWire/WirePlumber for Raspberry Pi audio output
+- `wlr-randr` for Wayland HDMI output power control
 - A MagicMirror module for status integration and notifications
 
 The checked-in configuration targets the `Art Wall` Raspberry Pi installation
@@ -37,7 +38,15 @@ surface.
 
 The receiver daemon interprets UxPlay lifecycle events and coordinates PM2.
 MagicMirror stops only while a video-mirroring stream is active. Audio-only
-AirPlay leaves MagicMirror visible and changes only the audio path.
+AirPlay leaves MagicMirror running.
+
+### Display power changes are temporary
+
+The daemon reads and saves the enabled state of the physical `HDMI-A-1` Wayland
+output when the first AirPlay audio or video stream starts. It then enables the
+output at its preferred mode so an off display wakes for either kind of sharing.
+After the last media stream ends, it restores the saved on/off state. Receiver
+startup by itself does not wake the screen.
 
 ### One low-latency profile serves all supported clients
 
@@ -70,12 +79,15 @@ flowchart LR
         UxPlay -->|"lifecycle output"| Daemon
         Daemon --> Status["Runtime status file"]
         Daemon -->|"save, set, restore"| Wpctl["wpctl"]
+        Daemon -->|"save, on, restore"| WlrRandr["wlr-randr"]
     end
 
     UxPlay --> Video["H.264 video"]
     Video --> Decoder["V4L2 hardware decoder"]
     Decoder --> Convert["Video conversion"]
     Convert --> Wayland["Fullscreen Wayland surface"]
+    Wayland --> HDMI["HDMI-A-1 display"]
+    WlrRandr -->|"power and preferred mode"| HDMI
 
     UxPlay --> Audio["AirPlay-controlled stream gain"]
     Audio --> Pulse["GStreamer pulsesink"]
@@ -92,11 +104,12 @@ flowchart LR
 | Component | Responsibility |
 | --- | --- |
 | `systemd/mmm-airplay-receiver.service` | Starts and supervises the receiver independently from MagicMirror |
-| `receiver_daemon.js` | Owns UxPlay and serializes display and volume handoffs |
-| `receiver-daemon.config.json` | Defines the deployed AirPlay, rendering, audio, volume, and PM2 profile |
+| `receiver_daemon.js` | Owns UxPlay and serializes display power, volume, and MagicMirror handoffs |
+| `receiver-daemon.config.json` | Defines the deployed AirPlay, rendering, audio, volume, display power, and PM2 profile |
 | `lib/uxplay.js` | Validates receiver settings and builds the UxPlay command and graphical-session environment |
 | `lib/daemon-events.js` | Classifies UxPlay audio/video events and tracks both stream types independently |
 | `lib/system-volume.js` | Captures, caps, unmutes, and restores the PipeWire default-sink volume |
+| `lib/display-power.js` | Captures, enables, and restores the configured Wayland output power state |
 | `MMM-Airplay-Receiver.js` | Provides MagicMirror-side state, optional UI, and module notifications |
 | `node_helper.js` | Polls the external status file and forwards state into MagicMirror |
 | UxPlay | Implements AirPlay discovery, connection handling, and media reception |
@@ -104,23 +117,24 @@ flowchart LR
 | Avahi | Advertises the receiver over mDNS |
 | PM2 | Runs MagicMirror and accepts the daemon's stop/start requests |
 | PipeWire/WirePlumber | Routes audio to the Raspberry Pi's selected HDMI output |
+| `wlr-randr` | Queries and changes the physical Wayland output state |
 
 ## Operating sequence
 
 The daemon maintains independent `audioActive` and `videoActive` state. It
-derives the two handoffs from those flags:
+derives its session handoffs from those flags:
 
-| Audio | Video | Receiver state | Pi volume | MagicMirror |
-| --- | --- | --- | --- | --- |
-| Inactive | Inactive | `READY` | Restored value | Running |
-| Active | Inactive | `STREAMING` (audio) | Temporary ceiling | Running |
-| Inactive | Active | `STREAMING` (mirroring) | Temporary ceiling | Stopped |
-| Active | Active | `STREAMING` (mirroring) | Temporary ceiling | Stopped |
+| Audio | Video | Receiver state | Pi volume | HDMI display | MagicMirror |
+| --- | --- | --- | --- | --- | --- |
+| Inactive | Inactive | `READY` | Restored value | Restored on/off state | Running |
+| Active | Inactive | `STREAMING` (audio) | Temporary ceiling | Forced on | Running |
+| Inactive | Active | `STREAMING` (mirroring) | Temporary ceiling | Forced on | Stopped |
+| Active | Active | `STREAMING` (mirroring) | Temporary ceiling | Forced on | Stopped |
 
-The volume handoff is active while either media stream is active. The display
-handoff is active only while video is active. This prevents audio-only playback
-from blanking the mirror and prevents either stream stopping early from
-restoring shared state while the other stream remains active.
+The temporary volume and HDMI power states remain active while either media
+stream is active. MagicMirror process ownership follows video only. This keeps
+MagicMirror visible during audio-only playback and prevents one stream stopping
+early from restoring shared state while the other stream remains active.
 
 ### Service startup
 
@@ -132,7 +146,8 @@ restoring shared state while the other stream remains active.
 4. The daemon starts UxPlay with line-buffered output.
 5. UxPlay advertises `Art Wall` through Avahi and reports that its server socket
    is initialized.
-6. The daemon writes a `READY` status record. MagicMirror continues running.
+6. The daemon writes a `READY` status record. MagicMirror continues running and
+   the configured HDMI output is left in its existing power state.
 
 ### Audio-only streaming
 
@@ -142,10 +157,12 @@ restoring shared state while the other stream remains active.
    audio-specific status message.
 4. The volume manager reads and stores the PipeWire default-sink volume and
    mute state, sets a 100% ceiling, and unmutes the sink.
-5. MagicMirror continues running because no video stream is active.
-6. UxPlay maps volume-button events onto the GStreamer stream gain.
-7. When UxPlay emits `raop_rtp exiting thread`, the daemon restores the saved Pi
-   volume and mute state.
+5. The display manager reads the `HDMI-A-1` enabled state and turns the output
+   on at its preferred mode.
+6. MagicMirror continues running because no video stream is active.
+7. UxPlay maps volume-button events onto the GStreamer stream gain.
+8. When UxPlay emits `raop_rtp exiting thread`, the daemon restores both the
+   saved Pi volume state and the saved HDMI on/off state.
 
 ### Screen mirroring start
 
@@ -154,9 +171,10 @@ restoring shared state while the other stream remains active.
    daemon tracks both events without treating either as the complete session.
 3. `raop_rtp_mirror starting mirroring` marks video active and changes the
    status message to screen mirroring.
-4. The volume handoff starts when the first audio or video stream becomes
-   active. A second start event does not overwrite the saved Pi volume.
-5. The video event causes PM2 to stop `MagicMirror`.
+4. The volume and HDMI power handoffs start when the first audio or video stream
+   becomes active. A second start event does not overwrite either saved state.
+5. The HDMI output is on before presentation and the video event causes PM2 to
+   stop `MagicMirror`.
 6. UxPlay renders video in a native fullscreen Wayland surface and sends any
    mirrored audio to the PipeWire-backed PulseAudio sink.
 
@@ -164,8 +182,8 @@ restoring shared state while the other stream remains active.
 
 The Apple device controls the AirPlay stream volume. UxPlay maps those volume
 events onto the GStreamer audio stream using the configured tapered gain curve.
-The Raspberry Pi master output remains at its temporary 100% ceiling while any
-AirPlay audio or video stream remains active.
+The Raspberry Pi master output remains at its temporary 100% ceiling and the
+HDMI display remains on while any AirPlay audio or video stream remains active.
 
 Video is decoded and presented independently of MagicMirror. The receiver
 daemon stays active, monitors UxPlay, records selected format and performance
@@ -177,25 +195,27 @@ messages, and waits for the disconnect event.
    lifecycle messages.
 2. The tracker marks video inactive and PM2 starts MagicMirror.
 3. If an audio stream is still active, the receiver remains `STREAMING` and the
-   100% volume ceiling remains in effect.
+   100% volume ceiling and forced-on HDMI state remain in effect.
 4. When the audio thread also exits, the tracker becomes fully inactive, the
-   daemon writes `READY`, and the saved PipeWire volume and mute state are
-   restored.
-5. If audio stops before video, the volume ceiling remains active until video
-   also stops and MagicMirror remains stopped until the video event ends.
+   daemon writes `READY`, and the saved PipeWire volume, mute, and HDMI output
+   states are restored.
+5. If audio stops before video, the volume ceiling and forced-on display remain
+   active until video also stops. MagicMirror remains stopped until the video
+   event ends.
 6. UxPlay remains active and advertised for the next client.
 
 ### Receiver or service shutdown
 
-If UxPlay exits unexpectedly, the daemon restores the saved audio state, starts
-MagicMirror, and schedules a receiver restart after the configured delay.
-Normal `SIGINT`, `SIGTERM`, and uncaught-error shutdown paths also request
-volume restoration and MagicMirror startup. The systemd unit includes an
-`ExecStopPost` fallback that starts MagicMirror when the service stops.
+If UxPlay exits unexpectedly, the daemon restores the saved audio and HDMI
+power states, starts MagicMirror, and schedules a receiver restart after the
+configured delay. Normal `SIGINT`, `SIGTERM`, and uncaught-error shutdown paths
+also request both restorations and MagicMirror startup. The systemd unit
+includes an `ExecStopPost` fallback that starts MagicMirror when the service
+stops.
 
 Duplicate lifecycle messages are idempotent. Repeated audio or video start
-events cannot replace the saved pre-session volume with the temporary 100%
-value, and repeated stop events do not repeat restoration or PM2 operations.
+events cannot replace the saved pre-session volume or display power state, and
+repeated stop events do not repeat restoration or PM2 operations.
 
 Like any in-memory cleanup mechanism, restoration cannot run after an immediate
 power loss or `SIGKILL`.
@@ -322,6 +342,61 @@ temporary ceiling.
 Set `manageSystemVolume` to `false` to leave the Pi master volume unchanged and
 use only UxPlay's AirPlay stream gain.
 
+## Display power management
+
+The daemon manages the physical Wayland output independently from MagicMirror
+process ownership. Audio-only AirPlay wakes the display but does not stop
+MagicMirror. Video AirPlay wakes the display and then stops MagicMirror so the
+fullscreen Wayland video surface is the only visible content.
+
+On the first audio or video stream, the display manager runs `wlr-randr` with
+the configured graphical-session environment and parses the block belonging to
+`HDMI-A-1`. This is deliberately output-specific: the compositor's `NOOP-1`
+headless output can remain enabled while the physical HDMI output is off.
+
+After saving `Enabled: yes` or `Enabled: no`, it wakes the output with:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+  /usr/bin/wlr-randr --output HDMI-A-1 --on --preferred
+```
+
+After the last audio or video stream ends, the manager restores the saved power
+state. A display that was off is returned to off:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+  /usr/bin/wlr-randr --output HDMI-A-1 --off
+```
+
+A display that was on is kept on and returned to its preferred mode with the
+first command. Duplicate UxPlay start and stop messages are idempotent, so they
+cannot overwrite the saved pre-session state. The manager does not change the
+display unless it first obtains a valid state to restore.
+
+The checked-in display configuration is:
+
+```json
+{
+  "manageDisplayPower": true,
+  "displayOutput": "HDMI-A-1",
+  "wlrRandrPath": "/usr/bin/wlr-randr",
+  "xdgRuntimeDir": "/run/user/1000",
+  "waylandDisplay": "wayland-0"
+}
+```
+
+| Option | Meaning |
+| --- | --- |
+| `manageDisplayPower` | Enables capture, forced-on sharing state, and restoration |
+| `displayOutput` | Physical Wayland output whose enabled state is managed |
+| `wlrRandrPath` | Absolute path to the Wayland output control command |
+| `xdgRuntimeDir` | Runtime directory containing the compositor socket |
+| `waylandDisplay` | Wayland compositor socket used for queries and changes |
+
+Set `manageDisplayPower` to `false` to leave display power entirely under the
+home automation system.
+
 ## MagicMirror integration
 
 The MagicMirror module operates in external-service mode. It does not start or
@@ -378,6 +453,7 @@ The deployed profile uses:
 - UxPlay 1.73.6
 - GStreamer with `v4l2h264dec`, `videoconvert`, `waylandsink`, and `pulsesink`
 - PipeWire/WirePlumber with `wpctl`
+- `wlr-randr` for Wayland output queries and power changes
 - Avahi for mDNS advertisement
 - Node.js and PM2 under `/usr/local/bin`
 
@@ -440,6 +516,7 @@ Verify the configured executable paths on the Pi:
 command -v node
 command -v pm2
 command -v wpctl
+command -v wlr-randr
 ```
 
 Install and start the user service:
@@ -470,7 +547,7 @@ systemctl --user status mmm-airplay-receiver.service
 pm2 status
 ```
 
-Follow receiver lifecycle, rendering, and volume messages:
+Follow receiver lifecycle, rendering, volume, and display-power messages:
 
 ```bash
 journalctl --user -u mmm-airplay-receiver.service -f
@@ -487,6 +564,13 @@ Inspect the audio graph and current default-sink volume:
 ```bash
 wpctl status
 wpctl get-volume @DEFAULT_AUDIO_SINK@
+```
+
+Inspect the physical display state from the graphical Wayland session:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 \
+  wlr-randr
 ```
 
 Check AirPlay discovery and hardware decoding:
@@ -524,4 +608,5 @@ npm run check
 The tests cover UxPlay argument generation, graphical-session discovery,
 lifecycle parsing, independent audio/video state, pairing, hardware-accelerated
 fullscreen rendering, volume configuration, duplicate session events,
-mute-state handling, and exact volume restoration.
+mute-state handling, exact volume restoration, target-specific `wlr-randr`
+parsing, duplicate display events, and display power restoration.
