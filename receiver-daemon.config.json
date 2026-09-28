@@ -26,6 +26,8 @@
     "-50:0",
     "-taper",
     "-srgb",
+    "no",
+    "-nc",
     "no"
   ],
   "restartOnExit": true,
@@ -41,6 +43,14 @@
   "manageDisplayPower": true,
   "displayOutput": "HDMI-A-1",
   "wlrRandrPath": "/usr/bin/wlr-randr",
+  "manageBlackFrameGuard": true,
+  "blackFrameCommand": "/usr/bin/gst-launch-1.0",
+  "blackFrameReadyDelayMs": 400,
+  "blackFrameTerminationTimeoutMs": 1500,
+  "blackFrameRate": 10,
+  "videoTeardownTimeoutMs": 2000,
+  "magicMirrorReadyDelayMs": 3500,
+  "receiverRecycleKillTimeoutMs": 2000,
   "receiverOutputSampleLines": 0,
   "performanceReportSamples": 3,
   "debugReceiver": true

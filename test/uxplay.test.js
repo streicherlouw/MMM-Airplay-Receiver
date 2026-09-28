@@ -83,10 +83,10 @@ test("classifies external daemon audio and video lifecycle events", () => {
     type: "stream", stream: "video", active: true
   });
   assert.deepEqual(classifyDaemonLine("raop_rtp_mirror exiting TCP thread"), {
-    type: "stream", stream: "video", active: false
+    type: "video-stopping"
   });
   assert.deepEqual(classifyDaemonLine("video_reset: type = RTP_Shutdown"), {
-    type: "stream", stream: "video", active: false
+    type: "stream", stream: "video", active: false, teardownConfirmed: true
   });
   assert.equal(classifyDaemonLine("unrelated debug line"), null);
 });
@@ -130,7 +130,16 @@ test("keeps the volume handoff active when video ends before audio", () => {
   lifecycle.apply(classifyDaemonLine("raop_rtp starting audio"));
   lifecycle.apply(classifyDaemonLine("raop_rtp_mirror starting mirroring"));
 
-  let state = lifecycle.apply(classifyDaemonLine("raop_rtp_mirror exiting TCP thread"));
+  assert.deepEqual(classifyDaemonLine("raop_rtp_mirror exiting TCP thread"), {
+    type: "video-stopping"
+  });
+  assert.deepEqual(lifecycle.snapshot(), {
+    audioActive: true,
+    videoActive: true,
+    anyActive: true
+  });
+
+  let state = lifecycle.apply(classifyDaemonLine("video_reset: type = RTP_Shutdown"));
   assert.equal(state.state, "STREAMING");
   assert.equal(state.message, "AirPlay audio is streaming");
   assert.equal(state.volumeChanged, false);
@@ -152,11 +161,13 @@ test("Art Wall daemon uses explicit Pi hardware decoding and native Wayland full
   assert.deepEqual(args.slice(args.indexOf("-vsync"), args.indexOf("-vsync") + 2), ["-vsync", "no"]);
   assert.ok(args.includes("-FPSdata"));
   assert.deepEqual(args.slice(args.indexOf("-db"), args.indexOf("-db") + 3), ["-db", "-50:0", "-taper"]);
+  assert.deepEqual(args.slice(args.indexOf("-nc"), args.indexOf("-nc") + 2), ["-nc", "no"]);
   assert.equal(daemonConfig.fps, 60);
   assert.equal(daemonConfig.manageSystemVolume, true);
   assert.equal(daemonConfig.systemVolumeLimitPercent, 100);
   assert.equal(daemonConfig.manageDisplayPower, true);
   assert.equal(daemonConfig.displayOutput, "HDMI-A-1");
+  assert.equal(daemonConfig.manageBlackFrameGuard, true);
   assert.match(daemonConfig.videoSink, /sync=false/);
   assert.match(daemonConfig.videoSink, /fullscreen=true/);
   assert.ok(!args.includes("-fs"));

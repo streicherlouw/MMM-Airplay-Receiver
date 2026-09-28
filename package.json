@@ -4,7 +4,7 @@
   "description": "AirPlay screen mirroring for MagicMirror using UxPlay",
   "main": "node_helper.js",
   "scripts": {
-    "check": "node --check MMM-Airplay-Receiver.js && node --check node_helper.js && node --check receiver_daemon.js && node --check lib/uxplay.js && node --check lib/daemon-events.js && node --check lib/system-volume.js && node --check lib/display-power.js",
+    "check": "node --check MMM-Airplay-Receiver.js && node --check node_helper.js && node --check receiver_daemon.js && node --check lib/uxplay.js && node --check lib/daemon-events.js && node --check lib/system-volume.js && node --check lib/display-power.js && node --check lib/black-frame-guard.js && node --check lib/video-handoff.js",
     "test": "node --test"
   },
   "keywords": [

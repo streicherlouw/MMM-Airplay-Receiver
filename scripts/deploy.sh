@@ -46,6 +46,8 @@ scp \
   "$module_root/lib/daemon-events.js" \
   "$module_root/lib/system-volume.js" \
   "$module_root/lib/display-power.js" \
+  "$module_root/lib/black-frame-guard.js" \
+  "$module_root/lib/video-handoff.js" \
   "$remote:$remote_target/lib/"
 scp \
   "$module_root/scripts/install-uxplay.sh" \
@@ -57,13 +59,11 @@ scp "$module_root/systemd/mmm-airplay-receiver.service" "$remote:$remote_target/
 
 ssh "$remote" chmod +x "$remote_target/scripts/install-uxplay.sh" "$remote_target/scripts/install-service.sh"
 
-if ! ssh "$remote" command -v uxplay >/dev/null 2>&1; then
-  if [[ "$install_uxplay" -eq 1 ]]; then
-    ssh -t "$remote" "$remote_target/scripts/install-uxplay.sh"
-  else
-    echo "UxPlay is not installed. Re-run with --install-uxplay." >&2
-    exit 3
-  fi
+if [[ "$install_uxplay" -eq 1 ]]; then
+  ssh -t "$remote" "$remote_target/scripts/install-uxplay.sh"
+elif ! ssh "$remote" command -v uxplay >/dev/null 2>&1; then
+  echo "UxPlay is not installed. Re-run with --install-uxplay." >&2
+  exit 3
 fi
 
 ssh "$remote" node --check "$remote_target/MMM-Airplay-Receiver.js"
@@ -73,6 +73,8 @@ ssh "$remote" node --check "$remote_target/lib/uxplay.js"
 ssh "$remote" node --check "$remote_target/lib/daemon-events.js"
 ssh "$remote" node --check "$remote_target/lib/system-volume.js"
 ssh "$remote" node --check "$remote_target/lib/display-power.js"
+ssh "$remote" node --check "$remote_target/lib/black-frame-guard.js"
+ssh "$remote" node --check "$remote_target/lib/video-handoff.js"
 
 if [[ "$restart_magicmirror" -eq 1 ]]; then
   ssh "$remote" sh -s <<'REMOTE_RESTART'

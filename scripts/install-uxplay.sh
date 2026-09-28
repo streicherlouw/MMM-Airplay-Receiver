@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-UXPLAY_VERSION="${UXPLAY_VERSION:-v1.73.6}"
+UXPLAY_VERSION="${UXPLAY_VERSION:-v1.73.7}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "This installer is intended for Raspberry Pi OS or another Debian-based Linux." >&2

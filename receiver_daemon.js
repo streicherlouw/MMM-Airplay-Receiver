@@ -4,10 +4,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { execFile, spawn } = require("node:child_process");
 const { promisify } = require("node:util");
+const { BlackFrameGuard } = require("./lib/black-frame-guard");
 const { buildReceiverEnvironment, buildUxplayArgs, normalizeConfig } = require("./lib/uxplay");
 const { classifyDaemonLine, StreamLifecycle } = require("./lib/daemon-events");
 const { DisplayPowerManager } = require("./lib/display-power");
 const { SystemVolumeManager } = require("./lib/system-volume");
+const { VideoHandoffCoordinator } = require("./lib/video-handoff");
 
 const execFileAsync = promisify(execFile);
 const configurationPath = path.resolve(process.argv[2] || path.join(__dirname, "receiver-daemon.config.json"));
@@ -28,6 +30,15 @@ const receiverOutputSampleLines = Number.isInteger(daemonConfig.receiverOutputSa
 const performanceReportSamples = Number.isInteger(daemonConfig.performanceReportSamples)
   ? Math.max(0, Math.min(10, daemonConfig.performanceReportSamples))
   : 0;
+const videoTeardownTimeoutMs = Number.isInteger(daemonConfig.videoTeardownTimeoutMs)
+  ? Math.max(500, Math.min(10000, daemonConfig.videoTeardownTimeoutMs))
+  : 2000;
+const magicMirrorReadyDelayMs = Number.isInteger(daemonConfig.magicMirrorReadyDelayMs)
+  ? Math.max(0, Math.min(15000, daemonConfig.magicMirrorReadyDelayMs))
+  : 3500;
+const receiverRecycleKillTimeoutMs = Number.isInteger(daemonConfig.receiverRecycleKillTimeoutMs)
+  ? Math.max(500, Math.min(10000, daemonConfig.receiverRecycleKillTimeoutMs))
+  : 2000;
 
 let receiver = null;
 let restartTimer = null;
@@ -39,6 +50,9 @@ let lastState = null;
 let receiverOutputLinesRemaining = 0;
 let performanceReportsRemaining = 0;
 let capturingPerformanceReport = false;
+let controlledReceiverExit = null;
+
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 function log(message) {
   console.log(`[MMM-Airplay-Receiver daemon] ${message}`);
@@ -63,6 +77,22 @@ const displayPower = new DisplayPowerManager(
   log
 );
 const streamLifecycle = new StreamLifecycle();
+const blackFrameGuard = new BlackFrameGuard(
+  daemonConfig,
+  (command, args) => spawn(command, args, {
+    env: receiverEnvironment,
+    stdio: ["ignore", "ignore", "ignore"]
+  }),
+  delay,
+  log
+);
+const videoHandoff = new VideoHandoffCoordinator({
+  showGuard: () => blackFrameGuard.show(),
+  hideGuard: () => blackFrameGuard.hide(),
+  onTimeout: () => recycleReceiverAfterMissingTeardown(),
+  timeoutMs: videoTeardownTimeoutMs,
+  logger: log
+});
 
 function writeStatus(state, message) {
   const status = {
@@ -103,8 +133,35 @@ function queueMagicMirror(shouldRun) {
   return pm2Queue;
 }
 
-function queueSessionHandoff({ anyActive, videoActive }) {
+function queueSessionHandoff({ anyActive, videoActive }, { releaseVideoGuard = false } = {}) {
   handoffQueue = handoffQueue.then(async () => {
+    if (releaseVideoGuard && !videoActive) {
+      const guardVisible = await blackFrameGuard.show();
+      await queueMagicMirror(true);
+      if (guardVisible && manageMagicMirror && magicMirrorReadyDelayMs > 0) {
+        log(`Holding black frame for ${magicMirrorReadyDelayMs} ms while ${pm2ProcessName} paints`);
+        await delay(magicMirrorReadyDelayMs);
+      }
+
+      const current = streamLifecycle.snapshot();
+      if (current.videoActive) {
+        await queueMagicMirror(false);
+      } else if (current.anyActive) {
+        await Promise.all([
+          systemVolume.beginSession(),
+          displayPower.beginSession()
+        ]);
+      } else {
+        await Promise.all([
+          systemVolume.endSession(),
+          displayPower.endSession()
+        ]);
+      }
+
+      await blackFrameGuard.hide();
+      return;
+    }
+
     if (anyActive) {
       await Promise.all([
         systemVolume.beginSession(),
@@ -131,6 +188,18 @@ function handleReceiverLine(line) {
   const event = classifyDaemonLine(text);
   if (event) {
     log(text);
+    if (event.type === "video-stopping") {
+      void videoHandoff.beginStopping();
+      return;
+    }
+    if (event.type === "stream" && event.stream === "video" && event.active) {
+      void videoHandoff.cancelStopping();
+    }
+    const releaseVideoGuard = event.type === "stream" &&
+      event.stream === "video" &&
+      event.active === false &&
+      event.teardownConfirmed === true;
+    if (releaseVideoGuard) void videoHandoff.confirmStopping();
     const lifecycle = streamLifecycle.apply(event);
     if (lifecycle.statusChanged) writeStatus(lifecycle.state, lifecycle.message);
     if (event.type === "stream" && event.stream === "video" && event.active) {
@@ -138,7 +207,9 @@ function handleReceiverLine(line) {
       performanceReportsRemaining = performanceReportSamples;
       capturingPerformanceReport = false;
     }
-    if (lifecycle.volumeChanged || lifecycle.displayChanged) queueSessionHandoff(lifecycle);
+    if (lifecycle.volumeChanged || lifecycle.displayChanged) {
+      queueSessionHandoff(lifecycle, { releaseVideoGuard });
+    }
     return;
   }
 
@@ -178,6 +249,49 @@ function handleReceiverLine(line) {
     receiverOutputLinesRemaining -= 1;
     log(`[UxPlay sample] ${text}`);
   }
+}
+
+function finishControlledReceiverExit(child) {
+  if (!controlledReceiverExit || controlledReceiverExit.child !== child) return false;
+  clearTimeout(controlledReceiverExit.killTimer);
+  const resolve = controlledReceiverExit.resolve;
+  controlledReceiverExit = null;
+  resolve();
+  return true;
+}
+
+function stopReceiverForRecycle() {
+  const child = receiver;
+  if (!child) return Promise.resolve();
+  if (controlledReceiverExit && controlledReceiverExit.child === child) {
+    return controlledReceiverExit.promise;
+  }
+
+  let resolveExit;
+  const promise = new Promise((resolve) => {
+    resolveExit = resolve;
+  });
+  const killTimer = setTimeout(() => {
+    if (receiver === child && child.exitCode === null && child.signalCode === null) {
+      log("UxPlay did not stop after SIGTERM; sending SIGKILL");
+      child.kill("SIGKILL");
+    }
+  }, receiverRecycleKillTimeoutMs);
+  controlledReceiverExit = { child, promise, resolve: resolveExit, killTimer };
+  child.kill("SIGTERM");
+  return promise;
+}
+
+async function recycleReceiverAfterMissingTeardown() {
+  await blackFrameGuard.show();
+  await stopReceiverForRecycle();
+  streamLifecycle.reset();
+  const handoff = queueSessionHandoff(
+    { anyActive: false, videoActive: false },
+    { releaseVideoGuard: true }
+  );
+  if (!shuttingDown) startReceiver();
+  await handoff;
 }
 
 function attachOutput(stream) {
@@ -229,20 +343,35 @@ function startReceiver() {
 
   child.once("error", (error) => {
     if (receiver === child) receiver = null;
+    if (finishControlledReceiverExit(child)) return;
+    const releaseVideoGuard = streamLifecycle.snapshot().videoActive || videoHandoff.pending;
+    if (releaseVideoGuard) void videoHandoff.confirmStopping();
     streamLifecycle.reset();
     writeStatus("ERROR", `Could not start UxPlay: ${error.message}`);
-    queueSessionHandoff({ anyActive: false, videoActive: false });
+    queueSessionHandoff(
+      { anyActive: false, videoActive: false },
+      { releaseVideoGuard }
+    );
     scheduleReceiverRestart();
   });
 
   child.once("close", (code, signal) => {
     if (receiver === child) receiver = null;
+    if (finishControlledReceiverExit(child)) {
+      log("Recycled UxPlay after unconfirmed video teardown");
+      return;
+    }
     if (shuttingDown) return;
+    const releaseVideoGuard = streamLifecycle.snapshot().videoActive || videoHandoff.pending;
+    if (releaseVideoGuard) void videoHandoff.confirmStopping();
     streamLifecycle.reset();
     const reason = signal ? `signal ${signal}` : `exit code ${code}`;
     writeStatus("ERROR", `UxPlay stopped (${reason})`);
     log(`UxPlay stopped (${reason})`);
-    queueSessionHandoff({ anyActive: false, videoActive: false });
+    queueSessionHandoff(
+      { anyActive: false, videoActive: false },
+      { releaseVideoGuard }
+    );
     scheduleReceiverRestart();
   });
 }
@@ -252,8 +381,15 @@ async function shutdown(signal) {
   shuttingDown = true;
   log(`Stopping after ${signal}`);
   if (restartTimer) clearTimeout(restartTimer);
+  const releaseVideoGuard = streamLifecycle.snapshot().videoActive || videoHandoff.pending;
+  if (releaseVideoGuard) await videoHandoff.confirmStopping();
   if (receiver) receiver.kill("SIGTERM");
-  await queueSessionHandoff({ anyActive: false, videoActive: false });
+  streamLifecycle.reset();
+  await queueSessionHandoff(
+    { anyActive: false, videoActive: false },
+    { releaseVideoGuard }
+  );
+  await blackFrameGuard.hide();
   process.exit(0);
 }
 
@@ -261,7 +397,14 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("uncaughtException", async (error) => {
   log(`Uncaught error: ${error.stack || error.message}`);
-  await queueSessionHandoff({ anyActive: false, videoActive: false });
+  const releaseVideoGuard = streamLifecycle.snapshot().videoActive || videoHandoff.pending;
+  if (releaseVideoGuard) await videoHandoff.confirmStopping();
+  streamLifecycle.reset();
+  await queueSessionHandoff(
+    { anyActive: false, videoActive: false },
+    { releaseVideoGuard }
+  );
+  await blackFrameGuard.hide();
   process.exit(1);
 });
 

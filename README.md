@@ -40,6 +40,16 @@ The receiver daemon interprets UxPlay lifecycle events and coordinates PM2.
 MagicMirror stops only while a video-mirroring stream is active. Audio-only
 AirPlay leaves MagicMirror running.
 
+### Video handoffs never expose the previous frame
+
+An early mirror-thread stop message starts a temporary fullscreen black
+GStreamer surface but does not release session resources. The daemon waits for
+UxPlay to confirm renderer teardown before restarting MagicMirror. It holds the
+black surface until MagicMirror has had time to paint, restores volume and
+display power, and then removes the surface. If UxPlay does not confirm teardown
+within two seconds, the daemon recycles UxPlay under the black cover to ensure
+that its Wayland surface is destroyed.
+
 ### Display power changes are temporary
 
 The daemon reads and saves the enabled state of the physical `HDMI-A-1` Wayland
@@ -80,12 +90,14 @@ flowchart LR
         Daemon --> Status["Runtime status file"]
         Daemon -->|"save, set, restore"| Wpctl["wpctl"]
         Daemon -->|"save, on, restore"| WlrRandr["wlr-randr"]
+        Daemon -->|"cover during teardown"| Guard["Black-frame guard"]
     end
 
     UxPlay --> Video["H.264 video"]
     Video --> Decoder["V4L2 hardware decoder"]
     Decoder --> Convert["Video conversion"]
     Convert --> Wayland["Fullscreen Wayland surface"]
+    Guard --> Wayland
     Wayland --> HDMI["HDMI-A-1 display"]
     WlrRandr -->|"power and preferred mode"| HDMI
 
@@ -110,6 +122,8 @@ flowchart LR
 | `lib/daemon-events.js` | Classifies UxPlay audio/video events and tracks both stream types independently |
 | `lib/system-volume.js` | Captures, caps, unmutes, and restores the PipeWire default-sink volume |
 | `lib/display-power.js` | Captures, enables, and restores the configured Wayland output power state |
+| `lib/black-frame-guard.js` | Runs and supervises the temporary fullscreen black Wayland surface |
+| `lib/video-handoff.js` | Debounces stop hints, waits for teardown confirmation, and invokes the timeout fallback |
 | `MMM-Airplay-Receiver.js` | Provides MagicMirror-side state, optional UI, and module notifications |
 | `node_helper.js` | Polls the external status file and forwards state into MagicMirror |
 | UxPlay | Implements AirPlay discovery, connection handling, and media reception |
@@ -191,27 +205,34 @@ messages, and waits for the disconnect event.
 
 ### Screen mirroring end
 
-1. UxPlay reports video shutdown through its mirror reset or thread-exit
-   lifecycle messages.
-2. The tracker marks video inactive and PM2 starts MagicMirror.
-3. If an audio stream is still active, the receiver remains `STREAMING` and the
+1. UxPlay reports that its mirror thread is stopping. The daemon immediately
+   starts the fullscreen black-frame guard but continues to treat video as
+   active.
+2. UxPlay emits `video_reset: type = RTP_Shutdown` after stopping and destroying
+   its renderer. Only this confirmation marks video inactive.
+3. If no confirmation arrives within two seconds, the daemon terminates and
+   relaunches UxPlay while the black guard remains visible.
+4. PM2 starts MagicMirror and the guard remains in place for the configured
+   3.5-second presentation interval.
+5. If an audio stream is still active, the receiver remains `STREAMING` and the
    100% volume ceiling and forced-on HDMI state remain in effect.
-4. When the audio thread also exits, the tracker becomes fully inactive, the
+6. When the audio thread also exits, the tracker becomes fully inactive, the
    daemon writes `READY`, and the saved PipeWire volume, mute, and HDMI output
    states are restored.
-5. If audio stops before video, the volume ceiling and forced-on display remain
+7. If audio stops before video, the volume ceiling and forced-on display remain
    active until video also stops. MagicMirror remains stopped until the video
    event ends.
-6. UxPlay remains active and advertised for the next client.
+8. The black guard is removed only after the replacement presentation or saved
+   power state is in place. UxPlay remains advertised for the next client.
 
 ### Receiver or service shutdown
 
-If UxPlay exits unexpectedly, the daemon restores the saved audio and HDMI
-power states, starts MagicMirror, and schedules a receiver restart after the
-configured delay. Normal `SIGINT`, `SIGTERM`, and uncaught-error shutdown paths
-also request both restorations and MagicMirror startup. The systemd unit
-includes an `ExecStopPost` fallback that starts MagicMirror when the service
-stops.
+If UxPlay exits unexpectedly during video, the daemon first covers the output,
+then restores the saved audio and HDMI power states, starts MagicMirror, and
+schedules a receiver restart after the configured delay. Normal `SIGINT`,
+`SIGTERM`, and uncaught-error shutdown paths apply the same guarded restoration.
+The systemd unit includes an `ExecStopPost` fallback that starts MagicMirror
+when the service stops.
 
 Duplicate lifecycle messages are idempotent. Repeated audio or video start
 events cannot replace the saved pre-session volume or display power state, and
@@ -234,7 +255,7 @@ The deployed video profile is defined in `receiver-daemon.config.json`:
 | Color handling | `-bt709 -srgb no` | Selects the color path used by the Raspberry Pi display pipeline |
 | UxPlay fullscreen | `false` | Leaves generic `-fs` disabled |
 | Video sink | Native fullscreen `waylandsink` | Owns the complete Wayland output while mirroring |
-| Freeze behavior | `-nofreeze` | Closes the video surface when mirroring ends |
+| Window cleanup | `-nofreeze -nc no` | Requests renderer closure for timeout resets and normal client stops |
 | Timing | `-vsync no`, `sync=false`, `async=false` | Presents frames immediately instead of queueing for timestamp playback |
 
 The generated decoder and converter arguments are:
@@ -253,6 +274,42 @@ waylandsink fullscreen=true sync=false async=false enable-last-sample=false proc
 Fullscreen is deliberately owned by `waylandsink fullscreen=true`. The daemon's
 `fullscreen: false` setting only disables UxPlay's generic `-fs` option; it does
 not make the resulting video window non-fullscreen.
+
+## Black-frame teardown guard
+
+The guard is a separate short-lived GStreamer pipeline:
+
+```text
+videotestsrc is-live=true pattern=black
+  ! video/x-raw,width=1920,height=1080,framerate=10/1
+  ! waylandsink fullscreen=true sync=false async=false enable-last-sample=false
+```
+
+It starts on the first video-stop hint, covers the previous mirrored image, and
+stays mapped across UxPlay teardown, MagicMirror startup, and display-power
+restoration. A new video-start event cancels a pending teardown and removes the
+guard. Duplicate stop hints reuse the same process.
+
+The checked-in timing and process configuration is:
+
+```json
+{
+  "manageBlackFrameGuard": true,
+  "blackFrameCommand": "/usr/bin/gst-launch-1.0",
+  "blackFrameReadyDelayMs": 400,
+  "blackFrameTerminationTimeoutMs": 1500,
+  "blackFrameRate": 10,
+  "videoTeardownTimeoutMs": 2000,
+  "magicMirrorReadyDelayMs": 3500,
+  "receiverRecycleKillTimeoutMs": 2000
+}
+```
+
+`blackFrameReadyDelayMs` allows the first black frame to reach the compositor.
+`videoTeardownTimeoutMs` bounds the wait for UxPlay's renderer-reset message.
+`magicMirrorReadyDelayMs` keeps the guard above MagicMirror during application
+startup. The recycle kill timeout escalates from `SIGTERM` to `SIGKILL` only if
+the stale UxPlay process will not exit.
 
 ## Audio and volume pipeline
 
@@ -374,6 +431,10 @@ first command. Duplicate UxPlay start and stop messages are idempotent, so they
 cannot overwrite the saved pre-session state. The manager does not change the
 display unless it first obtains a valid state to restore.
 
+For video sessions, restoration occurs after UxPlay teardown and the guarded
+MagicMirror startup interval. The solution deliberately continues using
+`wlr-randr`; it does not require or invoke `wlopm`.
+
 The checked-in display configuration is:
 
 ```json
@@ -450,7 +511,7 @@ The deployed profile uses:
 - Native Wayland/labwc graphical session
 - MagicMirror managed by PM2 as `MagicMirror`
 - Node.js 18 or newer
-- UxPlay 1.73.6
+- UxPlay 1.73.7
 - GStreamer with `v4l2h264dec`, `videoconvert`, `waylandsink`, and `pulsesink`
 - PipeWire/WirePlumber with `wpctl`
 - `wlr-randr` for Wayland output queries and power changes
@@ -471,8 +532,9 @@ Configure SSH key authentication, then run from the development machine:
 ```
 
 `--install-uxplay` installs the Debian build and GStreamer dependencies, builds
-the pinned UxPlay 1.73.6 release, installs it under `/usr/local`, and enables
-Avahi. Omit the option on subsequent deployments.
+the pinned UxPlay 1.73.7 release, installs it under `/usr/local`, and enables
+Avahi. The option also upgrades an existing UxPlay installation to the pinned
+version. Omit it when deploying module-only changes.
 
 The deployment script copies only this module. It does not read or replace
 MagicMirror's `config.js`.
@@ -547,7 +609,8 @@ systemctl --user status mmm-airplay-receiver.service
 pm2 status
 ```
 
-Follow receiver lifecycle, rendering, volume, and display-power messages:
+Follow receiver lifecycle, guarded teardown, rendering, volume, and
+display-power messages:
 
 ```bash
 journalctl --user -u mmm-airplay-receiver.service -f
@@ -609,4 +672,5 @@ The tests cover UxPlay argument generation, graphical-session discovery,
 lifecycle parsing, independent audio/video state, pairing, hardware-accelerated
 fullscreen rendering, volume configuration, duplicate session events,
 mute-state handling, exact volume restoration, target-specific `wlr-randr`
-parsing, duplicate display events, and display power restoration.
+parsing, duplicate display events, display power restoration, black-frame
+process lifecycle, teardown acknowledgement, cancellation, and timeout fallback.
